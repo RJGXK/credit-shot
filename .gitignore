@@ -8,7 +8,9 @@ venv/
 
 # ---- 打包产物（体积大，由 tools/build_exe.py + tools/build_installer.py 重新生成）----
 build/
-dist/
+# dist/ 下只保留最终安装包入库（走 Git LFS），其余中间产物一律排除
+dist/*
+!dist/企业信用一键截图工具_安装包.exe
 
 # ---- 运行时产物（截图、探针输出、界面预览）----
 probe_out/
