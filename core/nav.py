@@ -1,0 +1,425 @@
+# -*- coding: utf-8 -*-
+"""core/nav.py —— 「从上级目录跳转」的统一导航层。
+
+为什么需要这一层
+----------------
+政府/司法站点普遍有 WAF（瑞数/知道创宇等）。它们对**直接输入网址直达**
+的请求判定更严：瑞数会先返回一张 521 的「Environment Checking」挑战页，
+带 Referer 的正常导航则直接放行。用户实测也确认了这一点：
+「网站都不要直接输入查询网站，都要从上级目录进行跳转，直接跳转到目标网站，
+会被检测异常」。
+
+所以统一做法：**先打开站点的上级目录页 → 在页面上找到指向目标的链接并点击**
+（点击产生的导航天然带 Referer），而不是 page.goto 目标 URL。
+
+每个站点配一条「入口链」：
+    ENTRY_CHAINS = {
+        "gsxt": [
+            {"landing": "https://www.samr.gov.cn/",      # 上级目录：市场监管总局
+             "match": "gsxt.gov.cn"},                    # 落地页上找含此域的链接
+            {"landing": "https://www.gsxt.gov.cn/",      # 兜底：直接进站点首页
+             "match": ""},
+        ],
+        ...
+    }
+
+同时解决另一个实测坑：**站点自己在 goto 期间发起跳转**会把
+`page.goto` 打断，抛
+``Navigation to "..." is interrupted by another navigation to "..."``。
+裁判文书网每次访问都会从 ``/`` 跳到 ``/website/wenshu/<id>/index.html``，
+所以这里统一用 :func:`goto` 包装，容忍这类打断（打断后页面其实已经在目标站）。
+"""
+from __future__ import annotations
+
+import time
+
+from core.errors import Aborted, Skipped
+
+__all__ = [
+    "goto", "goto_via_landing", "ENTRY_CHAINS", "landing_for",
+    "click_matching_link", "nav_state",
+]
+
+
+#: 全局可中断等待钩子。引擎启动时注册成 control.wait，
+#: 这样导航过程中的等待也能响应【中止】/【跳过此步】。
+_NAP = None
+
+
+def set_nap(fn) -> None:
+    """注册可中断等待函数（引擎调用一次）。"""
+    global _NAP
+    _NAP = fn
+
+
+def nap(seconds: float) -> None:
+    """等待 N 秒；已注册钩子时随时可被中止/跳过打断。"""
+    if _NAP is not None:
+        _NAP(seconds)
+    else:
+        time.sleep(seconds)
+
+
+#: 各站点的「入口链」：按顺序尝试，先命中先用。
+#: landing    = 上级目录页；
+#: match      = 在落地页里找链接时的关键词（**按 host 精确匹配优先**）；
+#: expect_host= 点完链接后期望到达的 host（不等就换下一条链）。
+ENTRY_CHAINS = {
+    # 国家企业信用信息公示系统：直连必被瑞数拦成白页，
+    # 必须先落到「国家市场监督管理总局」再点「国家企业信用信息公示系统」。
+    # 注意 samr 首页上还有 ypzsx/tspjg/xwqy 等 gsxt 子站，
+    # 所以必须用 host 精确匹配 www.gsxt.gov.cn。
+    "gsxt": [
+        {"landing": "https://www.samr.gov.cn/", "match": "www.gsxt.gov.cn",
+         "expect_host": "www.gsxt.gov.cn"},
+        {"landing": "https://www.samr.gov.cn/xw/", "match": "www.gsxt.gov.cn",
+         "expect_host": "www.gsxt.gov.cn"},
+        {"landing": "https://www.gsxt.gov.cn/", "match": ""},
+    ],
+    # 信用中国：直连返回 412，走政府门户跳转
+    "creditchina": [
+        {"landing": "https://www.gov.cn/", "match": "www.creditchina.gov.cn",
+         "expect_host": "www.creditchina.gov.cn"},
+        {"landing": "https://www.creditchina.gov.cn/", "match": ""},
+    ],
+    # 中国政府采购网：直连 403，走同域的上级目录
+    "ccgp": [
+        {"landing": "https://www.ccgp.gov.cn/index.shtml", "match": "www.ccgp.gov.cn",
+         "expect_host": "www.ccgp.gov.cn"},
+        {"landing": "https://www.ccgp.gov.cn/", "match": ""},
+    ],
+    # 住建部：走同域首页（本身就是站点根目录）
+    "mohurd": [
+        {"landing": "https://jzsc.mohurd.gov.cn/home", "match": "jzsc.mohurd.gov.cn",
+         "expect_host": "jzsc.mohurd.gov.cn"},
+        {"landing": "https://jzsc.mohurd.gov.cn/home", "match": ""},
+    ],
+    # 军队采购网
+    "plap": [
+        {"landing": "https://www.plap.mil.cn/freecms-glht/site/juncai/index.htm",
+         "match": "www.plap.mil.cn", "expect_host": "www.plap.mil.cn"},
+        {"landing": "https://www.plap.mil.cn/freecms-glht/site/juncai/jdjc/index.html",
+         "match": ""},
+    ],
+    # 最高法失信被执行人网
+    "zxgk": [
+        {"landing": "https://zxgk.court.gov.cn/shouye/index.html",
+         "match": "zxgk.court.gov.cn", "expect_host": "zxgk.court.gov.cn"},
+        {"landing": "https://zxgk.court.gov.cn/shixin/", "match": ""},
+    ],
+    # 中国裁判文书网：首页即上级目录，站内再点「登录 / 高级检索」
+    "wenshu": [
+        {"landing": "https://wenshu.court.gov.cn/", "match": ""},
+    ],
+    # 全国认证认可信息公共服务平台：上级目录是国家认监委官网，
+    # 从认监委首页点「认证认可信息公共服务平台」进站（直连易被判异常 IP）。
+    # 注意：认监委官网上第一个 cx.cnca.cn 链接指向的是「认证结果综合查询」
+    # （/CertECloud/result/skipResultList），不是首页 —— 必须用 match_path
+    # 精确挑「/CertECloud/index/index/page」那个链接，否则会跳到结果页。
+    "cnca": [
+        {"landing": "https://www.cnca.gov.cn/", "match": "cx.cnca.cn",
+         "expect_host": "cx.cnca.cn",
+         "match_path": "/CertECloud/index/index/page",
+         "expect_path": "/CertECloud/index/index/page"},
+        {"landing": "https://www.cnca.gov.cn/xxgk/", "match": "cx.cnca.cn",
+         "expect_host": "cx.cnca.cn",
+         "match_path": "/CertECloud/index/index/page",
+         "expect_path": "/CertECloud/index/index/page"},
+        {"landing": "https://cx.cnca.cn/CertECloud/index/index/page", "match": ""},
+    ],
+}
+
+
+def landing_for(site_key: str) -> list:
+    """取某站点的入口链。"""
+    return ENTRY_CHAINS.get(site_key, [])
+
+
+def _is_interrupted(exc: Exception) -> bool:
+    """判断异常是不是「站点自己跳走了」导致的导航打断。"""
+    text = str(exc).lower()
+    return ("interrupted by another navigation" in text
+            or "navigation to" in text and "interrupted" in text)
+
+
+def goto(page, url: str, timeout_ms: int = 45000,
+         wait_until: str = "domcontentloaded", log=print) -> bool:
+    """打开 URL，容忍「站点自跳转打断」。
+
+    裁判文书网、gsxt 都会在 goto 期间自己发起跳转，Playwright 会抛
+    ``Navigation ... is interrupted by another navigation to ...``。
+    这种情况下页面**其实已经到达了目标站**，不算失败。
+
+    返回是否成功（打断也算成功）。
+    """
+    try:
+        page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        return True
+    except Exception as exc:
+        if _is_interrupted(exc):
+            log("  ↻ 站点在跳转过程中自行跳转，已跟随到新页面")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            return True
+        raise
+
+
+def nav_state(page) -> dict:
+    """读当前页面的基本状态（用于判断有没有被 WAF 拦成白页）。"""
+    try:
+        return page.evaluate("""()=>({
+          url: location.href,
+          title: document.title || '',
+          len: (document.body ? (document.body.innerText||'').length : 0),
+          head: (document.body ? (document.body.innerText||'').replace(/\\s+/g,' ').slice(0,200) : ''),
+          blank: !document.body || (document.body.innerText||'').trim().length < 20,
+          checking: /Environment Checking|环境检测|安全验证|请稍候/i.test(document.title||''),
+        })""")
+    except Exception:
+        return {}
+
+
+def click_matching_link(page, match: str, log=print,
+                        expect_host: str = "", match_path: str = "",
+                        expect_path: str = "") -> str:
+    """在当前页面里点一个链接。
+
+    匹配优先级（**必须按 host 精确匹配优先**）：
+      1. 链接的 host 与 match 完全相同 —— 否则像 samr 首页上
+         「特殊食品信息查询平台」(ypzsx.gsxt.gov.cn) 会先于
+         「国家企业信用信息公示系统」(www.gsxt.gov.cn) 被命中；
+      2. 链接的 host 以 match 结尾（同域子路径）；
+      3. href 里含 match；
+      4. 链接文字含 match。
+
+    match_path 不为空时，**先在路径匹配的链接里挑**（挑不到才退回全量）。
+    认监委官网上第一个 cx.cnca.cn 链接指向的是「认证结果综合查询」
+    （/CertECloud/result/skipResultList），而不是首页
+    （/CertECloud/index/index/page）—— 不限定路径就会跳错页面。
+
+    expect_host 不为空时，点完会校验当前页 host 是否包含它；
+    不含就返回 'MISMATCH'，让调用方换下一条入口链。
+    expect_path 同理，校验落地的路径片段。
+
+    返回 'CLICK:<href>' / 'NONE' / 'MISMATCH' / 'ERR:<原因>'。
+    """
+    if not match:
+        return "NONE"
+    js = """
+    (arg)=>{
+      const kw=arg.kw, wantPath=arg.path||'';
+      const norm=s=>(s||'').replace(/\\s+/g,'');
+      const as=[...document.querySelectorAll('a[href]')];
+      const hostOf=a=>{try{return new URL(a.href,location.href).host;}catch(e){return '';}};
+      const pathOf=a=>{try{return new URL(a.href,location.href).pathname||'';}catch(e){return '';}};
+      // 先在路径匹配的链接里挑，挑不到再退回全量
+      let pool=as;
+      if(wantPath){
+        const sub=as.filter(a=>pathOf(a).indexOf(wantPath)>=0);
+        if(sub.length) pool=sub;
+      }
+      let hit=null;
+      // 1) host 完全相同
+      hit=pool.find(a=>hostOf(a)===kw);
+      // 2) host 以 kw 结尾（子域）
+      if(!hit) hit=pool.find(a=>{const h=hostOf(a); return h&&h.endsWith('.'+kw);});
+      // 3) href 含关键词
+      if(!hit) hit=pool.find(a=>{try{return (a.href||'').indexOf(kw)>=0;}catch(e){return false;}});
+      // 4) 文字匹配
+      if(!hit) hit=pool.find(a=>norm(a.innerText||a.textContent||'').indexOf(norm(kw))>=0);
+      if(!hit) return 'NONE';
+      hit.click();
+      return 'CLICK:'+hit.href.slice(0,90);
+    }
+    """
+    try:
+        r = page.evaluate(js, {"kw": match, "path": match_path})
+    except Exception as exc:
+        return "ERR:%s" % str(exc).splitlines()[0][:80]
+    if not str(r).startswith("CLICK"):
+        return str(r)
+    log("  点链接 → %s" % str(r)[6:60])
+    # 等跳转完成
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+    nap(2.0)
+    if expect_host:
+        try:
+            host = page.evaluate("()=>location.host")
+        except Exception:
+            host = ""
+        # host 不匹配有两种情况：
+        #   · 跳到了别的站（MISMATCH）—— 换下一条入口链
+        #   · 链接带 target=_blank 开了新标签页（POPUP）—— 切到新标签页继续
+        #
+        # 注意：认监委官网给的链接是**加速代理地址**，形如
+        #   ``1.443.https.cx.cnca.cn---xxxx.www.cnca.gov.cn.365cyd.com.cn:11080``
+        # host 并不等于 cx.cnca.cn，但里面**包含**它 —— 所以这里用「包含」判定，
+        # 不能用相等判定，否则会被误判成跳错站。
+        if host and expect_host not in host:
+            newp = _find_new_page(page, expect_host)
+            if newp is not None:
+                log("  → 链接开了新标签页，已切换过去")
+                try:
+                    newp.wait_for_load_state("domcontentloaded", timeout=20000)
+                except Exception:
+                    pass
+                return "POPUP:" + (newp.url or "")
+            return "MISMATCH:%s" % host
+    if expect_path:
+        try:
+            path = page.evaluate("()=>location.pathname")
+        except Exception:
+            path = ""
+        if path and expect_path not in path:
+            return "MISMATCH:path=%s" % path
+    return str(r)
+
+
+def _find_new_page(page, host: str):
+    """找同域的新标签页（链接带 target=_blank 时站点会开新窗口）。
+
+    host 可以是完整 host（如 www.gsxt.gov.cn）。
+    新标签页刚打开时 URL 可能还没定稿，所以先按 host 找，
+    找不到再看有没有非当前页的新页。
+    """
+    try:
+        ctx = page.context
+    except Exception:
+        ctx = None
+    if ctx is None:
+        return None
+    try:
+        pages = list(ctx.pages)
+    except Exception:
+        return None
+    # 1) host 精确匹配
+    for p in pages:
+        if p is page:
+            continue
+        try:
+            u = p.url or ""
+        except Exception:
+            continue
+        if host and host in u:
+            return p
+    # 2) 兜底：唯一一个新页，且不是空白页
+    others = [p for p in pages if p is not page]
+    if len(others) == 1:
+        try:
+            u = others[0].url or ""
+        except Exception:
+            u = ""
+        if u and u != "about:blank":
+            return others[0]
+    return None
+
+
+def goto_via_landing(page, site_key: str, log=print,
+                     timeout_ms: int = 45000) -> dict:
+    """按入口链「从上级目录跳转」进入站点，返回最终页面状态。
+
+    流程：落地页 → 站内匹配链接并点击 → 落地成功。
+    链接点不到时退化为直接打开落地页（多数站点首页本身就是上级目录）。
+    """
+    chain = landing_for(site_key)
+    if not chain:
+        return {"ok": False, "reason": "没有配置入口链"}
+    last = {}
+    for step in chain:
+        landing = step.get("landing") or ""
+        match = step.get("match") or ""
+        expect_host = step.get("expect_host") or ""
+        match_path = step.get("match_path") or ""
+        expect_path = step.get("expect_path") or ""
+        if not landing:
+            continue
+        try:
+            goto(page, landing, timeout_ms=timeout_ms, log=log)
+        except Exception as exc:
+            log("  ⚠ 落地页打开失败(%s)：%s" % (landing[:44], str(exc).splitlines()[0][:70]))
+            last = {"ok": False, "reason": str(exc)[:120]}
+            continue
+        nap(2.5)
+        st = nav_state(page)
+        if st.get("checking"):
+            log("  ⓘ 落地页正在做环境检测（%s），等待放行…" % landing[:40])
+            for _ in range(20):
+                nap(2.0)
+                st = nav_state(page)
+                if not st.get("checking"):
+                    break
+        if match:
+            r = click_matching_link(page, match, log=log, expect_host=expect_host,
+                                    match_path=match_path, expect_path=expect_path)
+            if str(r).startswith("POPUP"):
+                # 链接开了新标签页：把后续操作切到那个页面
+                newp = _find_new_page(page, expect_host)
+                if newp is None:
+                    # 点击后新页 URL 才定稿，再等一下找
+                    for _ in range(6):
+                        nap(1.5)
+                        newp = _find_new_page(page, expect_host)
+                        if newp is not None:
+                            break
+                if newp is not None:
+                    page = newp
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=20000)
+                    except Exception:
+                        pass
+                    nap(3.0)
+                    st = nav_state(page)
+                    if expect_path:
+                        try:
+                            cur = page.evaluate("()=>location.pathname")
+                        except Exception:
+                            cur = ""
+                        if cur and expect_path not in cur:
+                            log("  ↻ 落地路径不是 %s，换下一条入口链" % expect_path)
+                            last = {"ok": False, "reason": "落地路径不符"}
+                            continue
+                    if st.get("len", 0) > 200 and not st.get("blank"):
+                        log("  ✔ 经上级目录跳转进入：%s" % str(st.get("url", ""))[:70])
+                        return {"ok": True, "state": st, "via": landing,
+                                "page": newp}
+                    last = {"ok": False, "reason": "新标签页仍是空白页"}
+                else:
+                    last = {"ok": False, "reason": "新标签页未找到"}
+                continue
+            if str(r).startswith("MISMATCH"):
+                log("  ↻ 跳到了别的站（%s），换下一条入口链" % str(r)[9:40])
+                last = {"ok": False, "reason": "跳转到了非目标站"}
+                continue
+            if str(r).startswith("CLICK"):
+                nap(2.5)
+                st = nav_state(page)
+                if expect_path:
+                    try:
+                        cur = page.evaluate("()=>location.pathname")
+                    except Exception:
+                        cur = ""
+                    if cur and expect_path not in cur:
+                        log("  ↻ 落地路径不是 %s，换下一条入口链" % expect_path)
+                        last = {"ok": False, "reason": "落地路径不符"}
+                        continue
+                if st.get("len", 0) > 200 and not st.get("blank"):
+                    log("  ✔ 经上级目录跳转进入：%s" % str(st.get("url", ""))[:70])
+                    return {"ok": True, "state": st, "via": landing}
+                last = {"ok": False, "reason": "跳转后仍是空白页"}
+            else:
+                last = {"ok": False, "reason": "落地页上没有匹配的链接"}
+                continue
+        else:
+            # 没有匹配词：落地页本身就是目标站入口
+            if st.get("len", 0) > 200 and not st.get("blank"):
+                log("  ✔ 经上级目录进入：%s" % str(st.get("url", ""))[:70])
+                return {"ok": True, "state": st, "via": landing}
+            last = {"ok": False, "reason": "落地页空白"}
+    # 全部尝试失败：最后再直接打开一次目标（部分站点有兜底放行）
+    log("  ⚠ 入口链全部失败，最后再直接尝试一次")
+    return {"ok": False, "reason": last.get("reason", "入口链失败"), "state": last}

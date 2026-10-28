@@ -1,0 +1,626 @@
+/* 企业信用一键截图工具 —— 界面样式
+   配色沿用原桌面版的设计令牌，保证观感一致。 */
+
+:root {
+  --bg: #f1f4f9;
+  --card: #ffffff;
+  --card-soft: #f8fafd;
+  --border: #e1e7f0;
+  --border-soft: #eef1f7;
+  --text: #16202f;
+  --text-dim: #5a6880;
+  --text-faint: #97a3b8;
+  --accent: #2563eb;
+  --accent-hover: #3b78f0;
+  --accent-deep: #1a49b8;
+  --accent-soft: #eaf1ff;
+  --accent-soft2: #d6e4ff;
+  --green: #0e9f6e;
+  --red: #e5484d;
+  --amber: #d97706;
+  --header-bg: #17389c;
+  --header-bg2: #2563eb;
+  --header-sub: #b9d0ff;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(22, 32, 47, .04), 0 6px 20px rgba(22, 32, 47, .06);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+        "Hiragino Sans GB", sans-serif;
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* ---------------------------------------------------- 品牌条 */
+.brand {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: clamp(8px, 1vw, 14px);
+  padding: clamp(9px, 1.1vw, 14px) clamp(12px, 1.6vw, 20px);
+  background: linear-gradient(120deg, var(--header-bg) 0%, var(--header-bg2) 100%);
+  color: #fff;
+}
+
+.brand-mark {
+  width: clamp(24px, 2.4vw, 30px);
+  height: clamp(24px, 2.4vw, 30px);
+  border-radius: 8px;
+  border: 3px solid rgba(255, 255, 255, .92);
+  flex: 0 0 auto;
+}
+
+.brand-text { flex: 1 1 auto; min-width: 0; }
+.brand-text h1 {
+  margin: 0;
+  font-size: clamp(15px, 1.35vw, 19px);
+  font-weight: 700;
+  letter-spacing: .5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.brand-text p  {
+  margin: 2px 0 0;
+  font-size: clamp(11px, 1vw, 12.5px);
+  color: var(--header-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip {
+  display: inline-block;
+  padding: 5px 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #fff;
+  white-space: nowrap;
+}
+.chip-idle    { background: rgba(255, 255, 255, .18); }
+.chip-running { background: #0b3a80; }
+.chip-waiting { background: var(--amber); }
+.chip-done    { background: var(--green); }
+.chip-error   { background: var(--red); }
+
+/* ---------------------------------------------------- 布局
+   自适应要点：
+     * 左栏宽度用 clamp() —— 窄屏自动收窄，宽屏适度放宽，但不写死；
+     * 两栏之间用 flex-wrap，窗口太窄时自动上下堆叠（变成单列）；
+     * 所有固定像素都让位于 minmax(0, 1fr)，保证内容能压缩而不是撑破。 */
+.layout {
+  flex: 1 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: clamp(10px, 1.2vw, 16px);
+  padding: clamp(10px, 1.2vw, 16px) clamp(12px, 1.4vw, 18px) 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.col-left, .col-right {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(10px, 1.2vw, 14px);
+  min-height: 0;
+  /* .layout 是 flex-wrap 容器：行高由内容决定，align-items:stretch 压不下去，
+     内容一高整页就溢出、底部被裁。显式给高度把两栏钉在布局区内。 */
+  height: 100%;
+}
+/* 左栏：跟着窗口宽度走，两头都有界 */
+.col-left  { flex: 0 1 clamp(300px, 34vw, 470px); min-width: 280px; overflow-y: auto; }
+.col-right { flex: 1 1 340px; min-width: 0; overflow: hidden; }
+/* 左栏卡片保持自然高度，超出部分由左栏自己滚动 */
+.col-left > .card { flex: 0 0 auto; }
+
+/* 窗口太窄：两栏上下堆叠，各自占满一行 */
+@media (max-width: 900px) {
+  .layout {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .col-left, .col-right {
+    flex: 0 0 auto;         /* 高度按内容，别被拉伸 */
+    width: 100%;
+    min-width: 0;          /* 关键：允许收缩，否则里面的卡片会按内容宽度撑破 */
+    max-width: 100%;
+    height: auto;          /* 窄屏改成纵向堆叠，高度由内容决定 */
+  }
+  /* 右栏的清单与日志给个像样的高度，堆叠后仍能用 */
+  .col-right { min-height: 520px; }
+  .card { max-width: 100%; min-width: 0; }
+  .card-grow { flex: 0 0 auto; }
+  .card-log  { flex: 0 0 auto; min-height: 220px; }
+  /* 堆叠布局下，清单与日志各自内部滚动，不跟着页面无限拉长 */
+  .col-right .card-grow { height: 320px; }
+  .col-right .card-log  { height: 240px; }
+}
+
+/* ---------------------------------------------------- 卡片 */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+/* 两张卡片按 58 : 42 瓜分右栏剩余高度。
+   注意用 flex 系数（basis = 0）而不是百分比 basis：
+   百分比基准是父容器高度，父容器高度又是 auto（按内容撑开），
+   会形成「越撑越大」的循环，导致整页溢出、底部被裁掉。 */
+.card-grow { flex: 58 1 0; min-height: 0; }
+.card-log  { flex: 42 1 0; min-height: 0; }
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: clamp(8px, 1vw, 11px) clamp(12px, 1.3vw, 16px);
+  border-bottom: 1px solid var(--border-soft);
+  flex-wrap: wrap;
+}
+.card-title {
+  font-size: clamp(13.5px, 1.2vw, 15px);
+  font-weight: 700;
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.card-side {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.card-body { padding: clamp(10px, 1.2vw, 14px) clamp(12px, 1.3vw, 16px); min-height: 0; }
+
+/* 站点快速跳转条：清单很长时不用一路滚到底 */
+.site-jump {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px clamp(12px, 1.3vw, 16px);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--card-soft);
+}
+.jump-btn {
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 2px 11px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.jump-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-deep);
+  background: var(--accent-soft);
+}
+.jump-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+@keyframes siteFlash {
+  0%, 100% { background: transparent; }
+  25%      { background: var(--accent-soft); }
+}
+.site-block.flash {
+  animation: siteFlash .9s ease-out;
+  border-radius: 8px;
+}
+
+/* 独立滚动区：日志与清单各自滚动，互不影响 */
+.scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+.scroll::-webkit-scrollbar { width: 10px; }
+.scroll::-webkit-scrollbar-thumb {
+  background: #cfd8e6; border-radius: 6px; border: 2px solid var(--card);
+}
+.scroll::-webkit-scrollbar-thumb:hover { background: #b6c2d4; }
+
+/* ---------------------------------------------------- 表单控件 */
+.segmented {
+  display: flex;
+  background: var(--card-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg {
+  flex: 1 1 0;
+  padding: 9px 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.seg + .seg { border-left: 1px solid var(--border); }
+.seg:hover { background: var(--accent-soft); }
+.seg.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+textarea, input[type=text], input[type=password], input[type=number], select {
+  width: 100%;
+  min-width: 0;                 /* 允许在 grid/flex 里压缩，不撑破容器 */
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fbfcfe;
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+textarea {
+  height: clamp(120px, 18vh, 190px);
+  resize: vertical;
+  margin-top: 10px;
+  line-height: 1.7;
+  font-family: "Microsoft YaHei UI", Consolas, monospace;
+}
+textarea:focus, input:focus, select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .12);
+}
+
+/* 表单行用 grid：标签列固定，控件列自适应，避免控件被挤成竖排 */
+.field-row {
+  display: grid;
+  grid-template-columns: minmax(52px, 68px) minmax(0, 1fr) auto;
+  gap: 8px 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.field-row.two {
+  grid-template-columns: minmax(48px, 68px) minmax(0, 1fr) minmax(48px, 68px) minmax(0, 1.45fr);
+}
+.field-row > label { color: var(--text-dim); font-size: 13px; }
+.field-row input[type=text], .field-row select { width: 100%; min-width: 0; }
+.field-row input[type=number] { width: min(96px, 100%); }
+.field-row .note {
+  grid-column: 2 / -1;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.field-row .check {
+  grid-column: 2 / -1;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.check input { width: 15px; height: 15px; accent-color: var(--accent); }
+
+/* 窄容器：表单行改成上下堆叠，标签在上、控件在下 */
+@media (max-width: 1180px) {
+  .field-row.two {
+    grid-template-columns: minmax(48px, 68px) minmax(0, 1fr);
+  }
+  .field-row.two > *:nth-child(3) { grid-column: 1; }
+  .field-row.two > *:nth-child(4) { grid-column: 2; }
+}
+
+.hint {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  line-height: 1.7;
+}
+.muted { color: var(--text-dim); }
+
+/* ---------------------------------------------------- 按钮 */
+.btn {
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s, border-color .15s, color .15s, opacity .15s;
+}
+.btn:hover:not(:disabled) { background: var(--accent-soft); border-color: var(--accent-soft2); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+.btn-ghost { background: transparent; }
+
+.link-btn {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.link-btn:hover { text-decoration: underline; }
+
+/* ---------------------------------------------------- 采集项清单 */
+.site-block { margin-bottom: 14px; min-width: 0; }
+.site-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  margin-bottom: 4px;
+  background: var(--accent-soft);
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--accent-deep);
+  min-width: 0;
+}
+.site-head input { accent-color: var(--accent); width: 15px; height: 15px; flex: 0 0 auto; }
+.site-head .site-all { margin-left: auto; flex: 0 0 auto; }
+/* 站点名过长时省略，不要把卡片撑宽 */
+.site-head .site-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 10px 4px 26px;
+  font-size: 13.5px;
+  border-radius: 6px;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+}
+.step-row:hover { background: var(--card-soft); }
+.step-row input { accent-color: var(--accent); width: 15px; height: 15px; flex: 0 0 auto; }
+.step-row.disabled { opacity: .42; }
+.step-row .step-no { color: var(--text-faint); font-size: 12px; flex: 0 0 22px; }
+/* 采集项名称过长时省略号（窄屏/长名称都不撑破） */
+.step-row .step-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------- 日志 */
+.log {
+  font: 12.5px/1.75 Consolas, "Microsoft YaHei UI", monospace;
+  background: #fbfcfe;
+  border-top: 1px solid var(--border-soft);
+  padding: 10px 14px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-line { margin: 0; }
+.log-ok    { color: var(--green); }
+.log-error { color: var(--red); }
+.log-warn  { color: var(--amber); }
+.log-info  { color: var(--accent); }
+.log-plain { color: var(--text-dim); }
+
+/* ---------------------------------------------------- 工具栏 / 状态栏 */
+.toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: clamp(8px, 1vw, 12px) clamp(12px, 1.4vw, 16px) 6px;
+  flex-wrap: wrap;
+}
+.toolbar-left, .toolbar-right {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.toolbar-right { margin-left: auto; }
+
+/* 窗口太窄时两组按钮各占一行，不要挤在一起 */
+@media (max-width: 720px) {
+  .toolbar-right { margin-left: 0; width: 100%; }
+}
+
+.statusbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 4px clamp(12px, 1.6vw, 18px) 12px;
+  font-size: 12.5px;
+  flex-wrap: wrap;
+}
+.statusbar span { min-width: 0; }
+.statusbar span:last-child {
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* ---------------------------------------------------- 弹窗 */
+.dialog {
+  border: 0;
+  padding: 0;
+  border-radius: 12px;
+  width: min(660px, 94vw);
+  max-width: 94vw;
+  max-height: 92vh;
+  box-shadow: 0 18px 60px rgba(16, 24, 40, .28);
+  color: var(--text);
+}
+.dialog::backdrop { background: rgba(16, 24, 40, .38); }
+.dialog-inner {
+  display: flex;
+  flex-direction: column;
+  max-height: 92vh;
+  min-height: 0;
+}
+.dialog h2 {
+  margin: 0;
+  padding: 16px 20px 12px;
+  font-size: 17px;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.dialog h2 .muted { font-size: 12.5px; font-weight: 400; margin-left: 0; }
+.dialog-scroll {
+  padding: 14px 20px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+.section-title {
+  margin: 6px 0 8px;
+  font-size: 13.5px;
+  padding-left: 9px;
+  border-left: 3px solid var(--accent);
+  line-height: 1.2;
+}
+.dialog-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border-soft);
+  flex-wrap: wrap;
+}
+.dialog-bar .muted {
+  font-size: 12.5px;
+  flex: 1 1 220px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dialog-bar #btnCredClose { margin-left: auto; flex: 0 0 auto; }
+
+/* 凭据表
+   列宽全部用 minmax()：窄的时候账号/密码列可以压缩，不会把表格撑破。
+   平台名列在极窄时换成「不换行 + 省略号」，保证整表不溢出。 */
+.cred-table {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.cred-head, .cred-row {
+  display: grid;
+  grid-template-columns:
+    minmax(34px, 52px)
+    minmax(96px, 168px)
+    minmax(80px, 1fr)
+    minmax(72px, 1fr)
+    minmax(28px, 34px);
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+}
+.cred-head {
+  background: var(--card-soft);
+  font-size: 12px;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border);
+}
+.cred-row { border-bottom: 1px solid var(--border-soft); }
+.cred-row:last-child { border-bottom: 0; }
+.cred-row input[type=text] { padding: 5px 8px; font-size: 13px; min-width: 0; }
+.cred-row .c-chk { text-align: center; }
+.cred-row .c-chk input { accent-color: var(--accent); width: 15px; height: 15px; }
+.cred-row .c-name {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cred-row .c-eye { text-align: center; }
+.eye-btn {
+  border: 0; background: none; cursor: pointer;
+  font-size: 14px; color: var(--text-faint); padding: 2px 4px;
+}
+.eye-btn:hover { color: var(--accent); }
+
+/* 窄容器：凭据表改成「每行两格」的紧凑排法 */
+@media (max-width: 560px) {
+  .cred-head { display: none; }
+  .cred-row {
+    grid-template-columns: 30px minmax(0, 1fr) minmax(0, 1fr) 28px;
+    grid-template-areas: "chk name name eye";
+    row-gap: 6px;
+  }
+  .cred-row .c-chk { grid-area: chk; }
+  .cred-row .c-name { grid-area: name; }
+  .cred-row .c-eye { grid-area: eye; }
+  .cred-row input[type=text] { grid-column: 2 / 4; }
+}
+
+/* ---------------------------------------------------- 提示条 */
+.toast {
+  position: fixed;
+  right: clamp(12px, 2vw, 20px);
+  bottom: clamp(12px, 2vw, 20px);
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 11px 16px;
+  border-radius: 9px;
+  background: #16202f;
+  color: #fff;
+  font-size: 13px;
+  box-shadow: 0 10px 30px rgba(16, 24, 40, .25);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity .2s, transform .2s;
+  pointer-events: none;
+  z-index: 50;
+}
+.toast.show { opacity: 1; transform: none; }
+.toast.error { background: var(--red); }
+.toast.ok { background: var(--green); }

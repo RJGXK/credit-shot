@@ -1,0 +1,37 @@
+# ---- Python 缓存 / 虚拟环境 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---- 打包产物（体积大，由 tools/build_exe.py + tools/build_installer.py 重新生成）----
+build/
+dist/
+
+# ---- 运行时产物（截图、探针输出、界面预览）----
+probe_out/
+sample_output/
+web_preview/
+截图输出/
+output/
+*.log
+
+# ---- 凭据与密钥（绝不入库）----
+凭据.ini
+*.ini
+!installer.nsi
+
+# ---- 历史备份（回退用，不入库）----
+*.bak
+*.orig
+*.rej
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+desktop.ini
