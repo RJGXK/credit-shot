@@ -77,3 +77,22 @@ python tools/verify_cnca_logic.py:: 11 项 CNCA 处理器逻辑验证
 
 - 站点改版后需重新核对选择器；`tools/probe_*.py` 系列提供了逐站探针脚本。
 - 认监委等站点需**从上级目录跳转进入**，直连易被判异常 IP。
+
+## 许可
+
+[MIT](LICENSE) · Copyright (c) 2026 RJGXK
+
+## 下载
+
+Releases 页提供 Windows 安装包（NSIS 打包，含全部运行时依赖）：
+
+```
+企业信用一键截图工具_安装包.exe
+```
+
+安装后双击运行即可，只监听 `127.0.0.1`，浏览器界面与软件窗口均可用。
+
+> 仓库 `dist/` 下的安装包走 [Git LFS](https://git-lfs.com/) 存储，
+> 直接 clone 需执行 `git lfs pull` 才能取到真实文件；
+> 不想装 LFS 客户端的话，直接从 Releases 下载更省事。
+
