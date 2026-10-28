@@ -53,7 +53,24 @@ def create_app() -> FastAPI:
     app.include_router(router)
 
     if os.path.isdir(STATIC_DIR):
-        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+        class NoCacheStaticFiles(StaticFiles):
+            """静态资源禁缓存：升级后浏览器必须拿最新 JS/CSS。
+
+            Edge 的磁盘缓存对 127.0.0.1 一样生效 —— 升级版本后用户看到的
+            还是旧界面逻辑（例如全选框行为没变），排查起来极其费劲。
+            本程序静态资源很小，禁缓存没有任何性能代价。
+            """
+
+            def file_response(self, *args, **kwargs):
+                resp = super().file_response(*args, **kwargs)
+                resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                resp.headers["Pragma"] = "no-cache"
+                resp.headers["Expires"] = "0"
+                return resp
+
+        app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR),
+                  name="static")
 
     @app.get("/", include_in_schema=False)
     def index():

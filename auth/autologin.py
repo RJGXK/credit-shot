@@ -467,14 +467,18 @@ def _gsxt_has_geetest(page) -> bool:
         return False
 
 
-def _gsxt_open_login(page, log: LogFn, timeout: float = 20.0) -> bool:
-    """点开 gsxt 首页右上角的「登录」。
+def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
+    """点开 gsxt 的登录页。
 
-    实测结构：首页导航栏里有一个独立的「登录」入口，
-    点后出现 ``.loginBox`` 登录框（含 #UserName / #gsxtp / #btn_login）。
+    实测（2026-10）：gsxt 首页的「登录」是**整页跳转**到实名认证子站
+    ``shiming.gsxt.gov.cn/socialuser-use-rllogin.html``，
+    登录表单（#UserName / #gsxtp / #btn_login）在那个页面上。
+    所以这里点击后要等**页面跳转**完成，而不是等同页弹窗出现。
     """
     js = """
     ()=>{
+      // 已在登录页就直接算成功
+      if(document.getElementById('UserName')) return 'ALREADY';
       const norm=s=>(s||'').replace(/\\s+/g,'').trim();
       const els=[...document.querySelectorAll('a,span,div,li,button')];
       // 优先找导航栏里独立的「登录」（不要点到「用户登录」「登录注册」这类长文字）
@@ -489,14 +493,41 @@ def _gsxt_open_login(page, log: LogFn, timeout: float = 20.0) -> bool:
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if _js_action(page, js, timeout=2500):
-            time.sleep(1.5)
-            try:
-                if page.evaluate("()=>!!document.getElementById('UserName')"):
-                    return True
-            except Exception:
-                pass
+        # 用 eval_retry 拿**脚本真实返回值**（"ALREADY"/"CLICK"/"NONE"）。
+        # 不能用 _js_action：它走 wait_for_function 时只回 True/False，
+        # 字符串结果会被丢掉（selftest 也踩过这个坑）。
+        try:
+            from core.page import eval_retry
+            r = str(eval_retry(page, js, None, tries=1, delay=0.5) or "")
+        except Exception:
+            # 整页跳转进行中，上下文销毁属正常
+            r = ""
+        if r == "ALREADY":
+            return True
+        if r.startswith("CLICK"):
+            # 等跳转完成 + 登录表单出现（最多 15 秒）
+            d2 = time.time() + 15
+            while time.time() < d2:
+                time.sleep(1.5)
+                try:
+                    if page.evaluate(
+                            "()=>!!document.getElementById('UserName')"):
+                        log("  ✔ 已进入 gsxt 登录页（shiming.gsxt.gov.cn）")
+                        return True
+                except Exception:
+                    pass
         time.sleep(1.5)
+    # 兜底：直接打开登录子站页
+    try:
+        page.goto("https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html",
+                  wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+        if page.evaluate("()=>!!document.getElementById('UserName')"):
+            log("  ✔ 已直达 gsxt 登录页")
+            return True
+    except Exception:
+        pass
+    return False
     return False
 
 
@@ -640,7 +671,8 @@ def _login_gsxt(page, username: str, password: str, log: LogFn,
             if not _gsxt_has_geetest(page):
                 _gsxt_submit(page)
                 log("  → 已再次提交登录…")
-            d2 = time.time() + 45
+            d2 = time.time() + 60
+            jumped_home = False
             while time.time() < d2:
                 time.sleep(1.5)
                 # 瑞数 WAF 遇到白页或环境检测页，等待其放行
@@ -650,6 +682,26 @@ def _login_gsxt(page, username: str, password: str, log: LogFn,
                         continue
                 except Exception:
                     pass
+
+                # ★ 先查「是否已跳回首页」再查极验：
+                # gsxt 登录成功后**整页跳回** www.gsxt.gov.cn/index.html（实测），
+                # 登录页句柄上什么成功标志都没有；极验弹层 DOM 还可能残留，
+                # 先走 _gsxt_judge 会一直误判 captcha 死循环。
+                try:
+                    cur_url = page.url or ""
+                    if "shiming.gsxt.gov.cn" not in cur_url:
+                        # 已离开登录子站：回到首页 = 登录成功
+                        try:
+                            page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass
+                        time.sleep(2.0)
+                        log("  ✔ 登录成功：已从登录页跳回首页")
+                        return LoginResult(ok=True, reason="登录后跳回首页",
+                                           filled=True)
+                except Exception:
+                    pass
+
                 s2, m2 = _gsxt_judge(page, log)
                 if s2 == "ok":
                     log("  ✔ 人工补完验证后登录成功（%s）" % m2)
@@ -661,11 +713,10 @@ def _login_gsxt(page, username: str, password: str, log: LogFn,
                     time.sleep(1.0)
                     continue
 
-                # 如果页面变成白页或跳转，容错等一下首页重新渲染
+                # 兜底：页面上下文里能读到首页搜索框也算登录成功
                 try:
                     has_kw = page.evaluate("()=>!!document.getElementById('keyword')")
                     if has_kw:
-                        # 首页已经重新加载完成，说明登录成功重定向到了首页
                         log("  ✔ 登录重定向完成，首页已就绪")
                         return LoginResult(ok=True, reason="登录重定向完成", filled=True)
                 except Exception:

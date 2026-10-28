@@ -201,6 +201,9 @@ class _FakePage:
     def __init__(self, frame):
         self.frames = [frame]
         self.text = ""
+        # gsxt 登录判定会用 page.url 判断「是否已跳回首页」；
+        # 默认给登录子站 URL，让替身行为贴近真实站点
+        self.url = "https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html"
 
     def evaluate(self, js, arg=None):
         if "document.body" in js:
@@ -210,7 +213,14 @@ class _FakePage:
             frame = self.frames[0]
             frame.filled.append(arg)
             return "OK/OK"
+        # gsxt 打开登录脚本：替身模拟「已在登录页」
+        if "ALREADY" in js:
+            return "ALREADY"
         return True
+
+    def wait_for_function(self, js, arg=None, timeout=None):
+        # 与 evaluate 同义（js_action 先试这个）；替身直接落 evaluate
+        return self.evaluate(js, arg)
 
 
 class _Clock:

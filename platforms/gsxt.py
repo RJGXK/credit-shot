@@ -78,6 +78,26 @@ class GsxtHandler(PlatformHandler):
                 self.engine.log("  左侧目录「%s」：%s" % (kw, r))
             self.engine.sleep(1.2)
 
+        # 详情页板块内容是**滚动懒加载**：没滚到过的板块 DOM 里是空的，
+        # 整页截图时那些板块就缺失了（用户实测「四个板块没法同时展示」）。
+        # 所以截图前把页面从头到尾滚一遍触发全部加载，再回到顶部。
+        self.engine.log("  滚动触发全部板块加载…")
+        page.evaluate("""()=>{
+          window.__csScrollStep = 0;
+          const step = () => {
+            window.scrollBy(0, Math.round(window.innerHeight * 0.8));
+            window.__csScrollStep += 1;
+            if (window.__csScrollStep < 40 &&
+                window.scrollY + window.innerHeight < document.body.scrollHeight - 4) {
+              setTimeout(step, 220);
+            } else {
+              window.scrollTo(0, 0);
+            }
+          };
+          step();
+        }""")
+        self.engine.sleep(4.0)   # 等滚动完成 + 异步内容渲染
+
         shared = ""
         for step in gsteps:
             t0 = time.time()
@@ -123,6 +143,21 @@ class GsxtHandler(PlatformHandler):
         所以这里改成等**搜索框 #keyword 真正可见**才算就绪。
         """
         # ---- 走上级目录跳转链 ----
+        # 注意：若当前页面停在登录子站（shiming.gsxt.gov.cn）或空白页，
+        # 先锚回首页域再走入口链，否则链上的 samr 落地判断会被旧页干扰。
+        try:
+            cur_url = page.url or ""
+        except Exception:
+            cur_url = ""
+        if "shiming.gsxt.gov.cn" in cur_url:
+            self.engine.log("  当前在登录子站，先回 gsxt 首页域")
+            try:
+                nav.goto(page, HOME_URLS["gsxt"],
+                         timeout_ms=self.engine.timeout * 1000,
+                         log=self.engine.log)
+                self.engine.sleep(2.0)
+            except Exception:
+                pass
         chain_res = nav.goto_via_landing(page, "gsxt", log=self.engine.log,
                                          timeout_ms=self.engine.timeout * 1000)
         # 链接带 target=_blank 时会开新标签页，后续操作要切过去。

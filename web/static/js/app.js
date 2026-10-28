@@ -76,10 +76,18 @@ function renderChecklist() {
     const all = document.createElement('input');
     all.type = 'checkbox';
     all.title = '全选本组';
-    all.addEventListener('change', () => {
-      block.querySelectorAll('.step-row input').forEach((cb) => {
-        if (!cb.disabled) { cb.checked = all.checked; }
-      });
+    // 三态全选：点一下「全勾」（除非已全勾 → 全不勾）。
+    // 不能直接依赖 all.checked —— 子项单独勾选时全选框状态不会跟着变，
+    // 飘掉的状态会让「全不勾后点全选」失效（实测踩坑）。
+    all.addEventListener('click', (e) => {
+      e.preventDefault();               // 阻止原生切换，状态完全由代码控制
+      const rows = [...block.querySelectorAll('.step-row input')]
+        .filter((cb) => !cb.disabled);
+      const anyUnchecked = rows.some((cb) => !cb.checked);
+      const target = anyUnchecked;      // 有没勾的 → 全勾；已全勾 → 全不勾
+      rows.forEach((cb) => { cb.checked = target; });
+      all.checked = target;
+      all.indeterminate = false;
       refreshCounts();
     });
     const name = document.createElement('span');
@@ -187,6 +195,17 @@ function refreshCounts() {
   const selected = usable.filter((cb) => cb.checked);
   $('countText').textContent =
     `已选 ${selected.length} / ${usable.length} 项（当前模式可用 ${usable.length} 项）`;
+  // 同步每个组头全选框的三态：全勾=勾、全不勾=空、部分勾=半选
+  document.querySelectorAll('#checklist .site-block').forEach((block) => {
+    const head = block.querySelector('.site-head input');
+    if (!head) { return; }
+    const rows = [...block.querySelectorAll('.step-row input')]
+      .filter((cb) => !cb.disabled);
+    if (!rows.length) { head.checked = false; head.indeterminate = false; return; }
+    const nChecked = rows.filter((cb) => cb.checked).length;
+    head.checked = nChecked === rows.length;
+    head.indeterminate = nChecked > 0 && nChecked < rows.length;
+  });
 }
 
 function selectedKeys() {
