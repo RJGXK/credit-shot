@@ -163,10 +163,9 @@ class CncaHandler(PlatformHandler):
             self._run_step(page, company, list_step, results, shots,
                            lambda p: self.reveal_cert_list(p, company))
 
-        # ---- 第 2 项：证书详细信息 ----
+        # ---- 第 2 项：证书详细信息（遍历截取所有有效证书的详情页）----
         if detail_step is not None:
-            self._run_step(page, company, detail_step, results, shots,
-                           lambda p: self.open_cert_detail(p, company))
+            self._run_detail_steps(page, company, detail_step, results, shots)
 
     def _run_step(self, page, company: str, step: dict,
                   results: List[StepResult], shots: List[str], action) -> None:
@@ -185,6 +184,95 @@ class CncaHandler(PlatformHandler):
             results.append(StepResult(step["no"], step["key"], step["title"],
                                       company, True, path=path,
                                       elapsed=time.time() - t0))
+        except Skipped:
+            self.engine.log("  ⤼ 本步已跳过")
+            results.append(StepResult(step["no"], step["key"], step["title"],
+                                      company, False, message="已跳过",
+                                      elapsed=time.time() - t0))
+        except Aborted:
+            raise
+        except Exception as exc:
+            self.engine.log("  ✘ 失败：%s" % str(exc).splitlines()[0])
+            results.append(StepResult(step["no"], step["key"], step["title"],
+                                      company, False, message=str(exc),
+                                      elapsed=time.time() - t0))
+
+    def _run_detail_steps(self, page, company: str, step: dict,
+                          results: List[StepResult], shots: List[str]) -> None:
+        """跑证书详细信息项：针对所有「有效」证书逐条点击进入详细页面并分别截图存证。"""
+        t0 = time.time()
+        try:
+            self.engine.check_stop()
+            self.engine.log("[%s] %s" % (step["no"], step["title"]))
+            # 确保证书列表已就绪
+            if not self.count_certs(page):
+                self.reveal_cert_list(page, company)
+
+            cards = self.pick_valid_cert_cards(page)
+            if not cards:
+                raise EngineError("证书列表里没有找到可查询的证书卡片")
+
+            valid_cards = [c for c in cards if c.get("isValid")]
+            target_cards = valid_cards if valid_cards else cards
+            self.engine.log("  找到 %d 张证书（其中有效证书 %d 张），将逐一查询并截图详情页面"
+                            % (len(cards), len(valid_cards)))
+
+            main_path = ""
+            detail_paths = []
+            for idx, c in enumerate(target_cards, start=1):
+                self.engine.check_stop()
+                card_num = c["index"]
+                desc = c.get("certNumber") or ("证书%d" % card_num)
+                status_text = "有效" if c.get("isValid") else (c.get("status") or "未知状态")
+                self.engine.log("  → 正在查询第 %d/%d 张证书详情（[%s] %s）…"
+                                % (idx, len(target_cards), status_text, desc))
+
+                # 点击卡片
+                clicked = page.evaluate("""(n)=>{
+                  const card = document.getElementById('certInfo' + n);
+                  if(!card) return 'NO_CARD';
+                  card.scrollIntoView({block: 'center'});
+                  card.click();
+                  return 'CLICK';
+                }""", card_num)
+                if clicked != "CLICK":
+                    self.engine.log("  ⚠ 证书卡片 certInfo%d 点击失败，跳过该张" % card_num)
+                    continue
+
+                self.engine.sleep(1.0)
+                # 等待极验验证（若触发）
+                self.wait_geetest(page, "证书详细信息（第%d张）" % idx)
+
+                # 等新标签页打开
+                detail_p = self.wait_detail_page(page)
+                if detail_p is None:
+                    self.engine.log("  ⚠ 未能打开第 %d 张证书详情标签页" % idx)
+                    continue
+
+                sub_step = dict(step)
+                if idx > 1:
+                    sub_step["title"] = "%s - 证书%d(%s)" % (step["title"], idx, desc)
+                shot_path = self.engine.shot_step(detail_p, company, sub_step)
+                shots.append(shot_path)
+                detail_paths.append(shot_path)
+                if not main_path:
+                    main_path = shot_path
+
+                # 截完关闭详情标签页，切回主列表继续下一张
+                try:
+                    detail_p.close()
+                except Exception:
+                    pass
+                self.engine.sleep(1.0)
+
+            if not main_path:
+                raise EngineError("所有有效证书详情页均未能成功打开")
+
+            msg = "共完成 %d 张有效证书详情截图" % len(detail_paths)
+            self.engine.log("  ✔ %s" % msg)
+            results.append(StepResult(step["no"], step["key"], step["title"],
+                                      company, True, path=main_path,
+                                      elapsed=time.time() - t0, message=msg))
         except Skipped:
             self.engine.log("  ⤼ 本步已跳过")
             results.append(StepResult(step["no"], step["key"], step["title"],
@@ -217,11 +305,24 @@ class CncaHandler(PlatformHandler):
 
         # ---- 首页：填企业名称 → 点【查询】→ 整页跳转 ----
         # 用 pathname 判断是不是首页：结果页也有 #orgName 输入框，光看元素会认错。
+        # 实测：认监委首次落地有时需**刷新一次**才真正进入（WAF/网关二次放行），
+        # 所以判定失败时先自动刷新再等一轮，而不是直接报错。
         ok = self.wait_ready(
             page,
             "()=>location.pathname.indexOf('/index/index/page')>=0"
             " && !!document.getElementById('orgName')",
             timeout=40)
+        if not ok:
+            self.engine.log("  ↻ 首页未就绪，自动刷新一次再等（站点常需二次放行）")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            ok = self.wait_ready(
+                page,
+                "()=>location.pathname.indexOf('/index/index/page')>=0"
+                " && !!document.getElementById('orgName')",
+                timeout=40)
         if not ok:
             raise EngineError("CNCA 首页没就绪（找不到企业名称输入框）")
         self.engine.sleep(1.5)
@@ -565,19 +666,43 @@ class CncaHandler(PlatformHandler):
             return None
         return n or None
 
-    def pick_cert_card(self, page):
-        """取第一张证书卡片（站点用 certInfo<n> 编号）。"""
+    def pick_valid_cert_cards(self, page) -> List[dict]:
+        """获取证书列表中所有卡片的信息并判定其是否属于「有效」证书。"""
         try:
-            r = page.evaluate("""()=>{
-              const c=document.querySelector('.certContent .certInfoSingle');
-              if(!c) return 0;
-              const m=(c.id||'').match(/certInfo(\\d+)/);
-              return Number((m&&m[1])||0);
+            items = page.evaluate("""()=>{
+              const cards = [...document.querySelectorAll('.certContent .certInfoSingle')];
+              return cards.map(c => {
+                const m = (c.id || '').match(/certInfo(\\d+)/);
+                const num = m ? Number(m[1]) : 0;
+                const txt = (c.innerText || '').replace(/\\s+/g, ' ');
+                // 提取证书编号
+                let certNumber = '';
+                const mNum = txt.match(/证书编号\\s*[:：]\\s*([A-Za-z0-9_-]+)/);
+                if(mNum) certNumber = mNum[1];
+                // 判定是否属于有效证书
+                const isProofInvalid = !!c.querySelector('.gzsbjyzmzy');
+                const hasValidWord = /有效/.test(txt);
+                const hasInvalidWord = /无效|撤销|暂停|注销|过期|失效/.test(txt);
+                const isValid = hasValidWord && !hasInvalidWord && !isProofInvalid;
+                return {
+                  index: num,
+                  id: c.id || '',
+                  certNumber: certNumber,
+                  isValid: isValid,
+                  status: isValid ? '有效' : (hasInvalidWord ? '已失效/撤销' : '其他'),
+                  text: txt.slice(0, 100)
+                };
+              }).filter(x => x.index > 0);
             }""")
+            return items if isinstance(items, list) else []
         except Exception:
+            return []
+
+    def pick_cert_card(self, page):
+        """取第一张有效证书卡片（若无有效则取第一张）。"""
+        cards = self.pick_valid_cert_cards(page)
+        if not cards:
             return None
-        try:
-            n = int(r or 0)
-        except Exception:
-            return None
-        return n or None
+        valid = [c for c in cards if c.get("isValid")]
+        target = valid[0] if valid else cards[0]
+        return target.get("index")

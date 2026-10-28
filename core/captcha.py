@@ -139,10 +139,12 @@ def denoise_captcha(data: bytes, dilate: int = 1, thr: int = 150):
         return data
 
 
-def preprocess_captcha(data: bytes, scale: int = 3, denoise: bool = True) -> bytes:
-    """验证码送识别前的预处理：去干扰线 -> 放大。
+def preprocess_captcha(data: bytes, scale: int = 2, denoise: bool = False) -> bytes:
+    """验证码送识别前的预处理：适度放大，保留彩色笔画。
 
-    放大是为了让打码服务更容易分清笔画（小图上的 2px 笔画很容易糊成一团）。
+    注意：现代 OCR / 打码模型对彩色原图的特征识别率最高，
+    粗暴二值化（denoise）会把彩色浅色笔画冲掉，导致识别率暴跌甚至误报。
+    因此默认 denoise=False，仅做适度平滑放大（scale=2）。
     """
     try:
         from PIL import Image
@@ -150,9 +152,9 @@ def preprocess_captcha(data: bytes, scale: int = 3, denoise: bool = True) -> byt
         return data
     try:
         cur = denoise_captcha(data) if denoise else data
-        im = Image.open(io.BytesIO(cur)).convert("RGB")
-        if scale and scale > 1:
-            im = im.resize((im.width * scale, im.height * scale), Image.LANCZOS)
+        im = Image.open(io.BytesIO(cur))
+        if scale and scale > 1 and im.width < 300:
+            im = im.resize((int(im.width * scale), int(im.height * scale)), Image.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, format="PNG")
         return buf.getvalue()
@@ -318,33 +320,110 @@ class CaptchaSolver:
     def _capture_captcha(self, page, img_selector: str, scope):
         """拿到当前验证码图片的字节。
 
-        优先用页面上已有的 <img> 截图；
-        如果截图是白板或加载不出来（ORB 拦截 / 坏图），再尝试用接口直接取原始字节。
+        多层稳固截取策略：
+        1. 确保图片已在浏览器中完成渲染（complete && naturalWidth > 0）；
+        2. 针对带 CSS transform / fixed 的弹层，临时消除平移干扰，
+           使 element.screenshot 0.1 秒内瞬间完成，杜绝 scroll-into-view 超时；
+        3. 若 element.screenshot 异常，无缝降级到视口绝对坐标切片（page.screenshot clip）；
+        4. 严禁对动态生成的验证码接口盲目发起 page.request.get(src)，避免服务端刷新 session
+           导致页面中的验证码作废。
         """
-        img = None
+        # 1. 等待图片真实加载就绪（最多等 4 秒）
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            ready = False
+            try:
+                ready = page.evaluate("""(sel)=>{
+                  const el = document.querySelector(sel);
+                  return !!(el && el.complete && (el.naturalWidth > 0 || el.offsetWidth > 0));
+                }""", img_selector)
+            except Exception:
+                pass
+            if ready:
+                break
+            self.nap(0.2)
+
+        # 2. 临时消除弹窗父级 transform 动画与滚动干扰
+        js_normalize = """(sel)=>{
+          const img = document.querySelector(sel);
+          if(!img) return null;
+          let p = img.parentElement;
+          let changed = [];
+          while(p && p !== document.body && p !== document.documentElement){
+            const st = window.getComputedStyle(p);
+            if(st.transform && st.transform !== 'none'){
+              const r = p.getBoundingClientRect();
+              changed.push({
+                el: p,
+                oldTrans: p.style.transform,
+                oldLeft: p.style.left,
+                oldTop: p.style.top
+              });
+              p.style.transform = 'none';
+              p.style.left = r.left + 'px';
+              p.style.top = r.top + 'px';
+            }
+            p = p.parentElement;
+          }
+          const rect = img.getBoundingClientRect();
+          window.__csRestores = changed;
+          return {x: Math.round(rect.x), y: Math.round(rect.y),
+                  width: Math.round(rect.width), height: Math.round(rect.height)};
+        }"""
+        js_restore = """()=>{
+          if(window.__csRestores){
+            for(const item of window.__csRestores){
+              try{
+                item.el.style.transform = item.oldTrans;
+                item.el.style.left = item.oldLeft;
+                item.el.style.top = item.oldTop;
+              }catch(e){}
+            }
+            delete window.__csRestores;
+          }
+        }"""
+
+        rect = None
+        try:
+            rect = page.evaluate(js_normalize, img_selector)
+        except Exception:
+            rect = None
+
+        raw = None
         try:
             img = (scope.query_selector(img_selector) if scope
                    else page.query_selector(img_selector))
-        except Exception:
-            img = None
-        if img is not None:
-            # 1) 先试截图
+            if img:
+                try:
+                    raw = img.screenshot(timeout=3000)
+                except Exception:
+                    pass
+            # 降级到 page clip 截图
+            if not raw and rect and rect.get("width", 0) > 0 and rect.get("height", 0) > 0:
+                try:
+                    raw = page.screenshot(clip=rect, timeout=3000)
+                except Exception:
+                    pass
+        finally:
             try:
-                raw = img.screenshot(timeout=20000)
-                if raw:
-                    return raw, "页面图片"
+                page.evaluate(js_restore)
             except Exception:
                 pass
-            # 2) 截图拿不到：试试直接从 src 取字节
-            try:
-                src = img.get_attribute("src") or ""
-            except Exception:
-                src = ""
-            if src.startswith("http"):
-                raw = self.fetch_image_bytes(page, src)
-                if raw:
-                    self.log("  ↻ 页面上的验证码图未能截图，已改用接口直接取图")
-                    return raw, "接口取图"
+
+        if raw:
+            return raw, "页面图片"
+
+        # 仅在非动态验证码（或确实没有任何方式截到图）时，才尝试兜底（记录提示）
+        try:
+            src = img.get_attribute("src") or "" if img else ""
+        except Exception:
+            src = ""
+        if src.startswith("http") and not any(k in src for k in ("verify", "captcha", "code", "random")):
+            raw = self.fetch_image_bytes(page, src)
+            if raw:
+                self.log("  ↻ 页面上的静态验证码图已改用接口直接取图")
+                return raw, "接口取图"
+
         return None, ""
 
     def _fill_captcha_input(self, page, scope_selector: str, text: str) -> bool:

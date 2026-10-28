@@ -176,6 +176,9 @@ def nav_state(page) -> dict:
           head: (document.body ? (document.body.innerText||'').replace(/\\s+/g,' ').slice(0,200) : ''),
           blank: !document.body || (document.body.innerText||'').trim().length < 20,
           checking: /Environment Checking|环境检测|安全验证|请稍候/i.test(document.title||''),
+          denied: /拒绝访问|你没有查看此页面的用户权限|Access Denied|403 Forbidden/i
+                  .test((document.body ? document.body.innerText : '')
+                        + ' ' + (document.title||'')),
         })""")
     except Exception:
         return {}
@@ -319,6 +322,40 @@ def _find_new_page(page, host: str):
     return None
 
 
+def _wait_ready_patient(page, timeout: float = 20.0, allow_reload: bool = False,
+                        log=print) -> dict:
+    """耐心等页面真正可用（WAF 环境检测/慢渲染期间不急着判失败）。
+
+    allow_reload=True 时：等待过半仍空白/被拒就自动 reload 一次再等——
+    部分站点（认监委加速代理）首次落地必须刷新一次才真正进入。
+    返回最终的 nav_state；可用时 len>200 且非 blank 非 checking。
+    """
+    deadline = time.time() + timeout
+    reloaded = False
+    st = nav_state(page)
+    while time.time() < deadline:
+        if (st.get("len", 0) > 200 and not st.get("blank")
+                and not st.get("checking") and not st.get("denied")):
+            return st
+        # 过半还卡着：刷新一次（很多政务站首次落地需要手动刷新才放行）
+        if (allow_reload and not reloaded
+                and time.time() > deadline - timeout / 2.0
+                and (st.get("blank") or st.get("denied"))):
+            log("  ↻ 页面仍未就绪，自动刷新一次再等放行…")
+            reloaded = True
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                try:
+                    page.reload()
+                except Exception:
+                    pass
+            nap(2.0)
+        nap(1.5)
+        st = nav_state(page)
+    return st
+
+
 def goto_via_landing(page, site_key: str, log=print,
                      timeout_ms: int = 45000) -> dict:
     """按入口链「从上级目录跳转」进入站点，返回最终页面状态。
@@ -328,8 +365,9 @@ def goto_via_landing(page, site_key: str, log=print,
     """
     chain = landing_for(site_key)
     if not chain:
-        return {"ok": False, "reason": "没有配置入口链"}
+        return {"ok": False, "reason": "没有配置入口链", "page": page}
     last = {}
+    init_page = page
     for step in chain:
         landing = step.get("landing") or ""
         match = step.get("match") or ""
@@ -346,13 +384,24 @@ def goto_via_landing(page, site_key: str, log=print,
             continue
         nap(2.5)
         st = nav_state(page)
+        if st.get("denied"):
+            log("  ↻ 落地页被拒绝访问（%s），换下一条入口链" % landing[:40])
+            last = {"ok": False, "reason": "落地页拒绝访问"}
+            continue
         if st.get("checking"):
             log("  ⓘ 落地页正在做环境检测（%s），等待放行…" % landing[:40])
             for _ in range(20):
                 nap(2.0)
                 st = nav_state(page)
+                if st.get("denied"):
+                    log("  ↻ 环境检测后仍被拒绝访问，换下一条入口链")
+                    st = {"denied": True}
+                    break
                 if not st.get("checking"):
                     break
+            if st.get("denied"):
+                last = {"ok": False, "reason": "落地页拒绝访问"}
+                continue
         if match:
             r = click_matching_link(page, match, log=log, expect_host=expect_host,
                                     match_path=match_path, expect_path=expect_path)
@@ -367,20 +416,24 @@ def goto_via_landing(page, site_key: str, log=print,
                         if newp is not None:
                             break
                 if newp is not None:
-                    page = newp
                     try:
-                        page.wait_for_load_state("domcontentloaded", timeout=20000)
+                        newp.wait_for_load_state("domcontentloaded", timeout=20000)
                     except Exception:
                         pass
-                    nap(3.0)
-                    st = nav_state(page)
+                    nap(2.0)
+                    st = _wait_ready_patient(newp, timeout=20.0)
                     if expect_path:
                         try:
-                            cur = page.evaluate("()=>location.pathname")
+                            cur = newp.evaluate("()=>location.pathname")
                         except Exception:
                             cur = ""
                         if cur and expect_path not in cur:
                             log("  ↻ 落地路径不是 %s，换下一条入口链" % expect_path)
+                            try:
+                                newp.close()
+                            except Exception:
+                                pass
+                            page = init_page
                             last = {"ok": False, "reason": "落地路径不符"}
                             continue
                     if st.get("len", 0) > 200 and not st.get("blank"):
@@ -388,6 +441,11 @@ def goto_via_landing(page, site_key: str, log=print,
                         return {"ok": True, "state": st, "via": landing,
                                 "page": newp}
                     last = {"ok": False, "reason": "新标签页仍是空白页"}
+                    try:
+                        newp.close()
+                    except Exception:
+                        pass
+                    page = init_page
                 else:
                     last = {"ok": False, "reason": "新标签页未找到"}
                 continue
@@ -397,7 +455,8 @@ def goto_via_landing(page, site_key: str, log=print,
                 continue
             if str(r).startswith("CLICK"):
                 nap(2.5)
-                st = nav_state(page)
+                # WAF 环境检测/慢渲染期间别急着判失败
+                st = _wait_ready_patient(page, timeout=20.0)
                 if expect_path:
                     try:
                         cur = page.evaluate("()=>location.pathname")
@@ -409,17 +468,20 @@ def goto_via_landing(page, site_key: str, log=print,
                         continue
                 if st.get("len", 0) > 200 and not st.get("blank"):
                     log("  ✔ 经上级目录跳转进入：%s" % str(st.get("url", ""))[:70])
-                    return {"ok": True, "state": st, "via": landing}
+                    return {"ok": True, "state": st, "via": landing, "page": page}
                 last = {"ok": False, "reason": "跳转后仍是空白页"}
             else:
                 last = {"ok": False, "reason": "落地页上没有匹配的链接"}
                 continue
         else:
             # 没有匹配词：落地页本身就是目标站入口
+            # WAF 环境检测（瑞数/加速乐）可能要十几秒才放行，耐心等；
+            # 认监委等站点首次落地常需刷新一次才真正进入 → allow_reload=True
+            st = _wait_ready_patient(page, timeout=30.0, allow_reload=True, log=log)
             if st.get("len", 0) > 200 and not st.get("blank"):
                 log("  ✔ 经上级目录进入：%s" % str(st.get("url", ""))[:70])
-                return {"ok": True, "state": st, "via": landing}
+                return {"ok": True, "state": st, "via": landing, "page": page}
             last = {"ok": False, "reason": "落地页空白"}
     # 全部尝试失败：最后再直接打开一次目标（部分站点有兜底放行）
     log("  ⚠ 入口链全部失败，最后再直接尝试一次")
-    return {"ok": False, "reason": last.get("reason", "入口链失败"), "state": last}
+    return {"ok": False, "reason": last.get("reason", "入口链失败"), "state": last, "page": page}

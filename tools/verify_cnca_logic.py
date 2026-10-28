@@ -189,6 +189,34 @@ def main():
         if not ok11:
             fails.append("测试11：把未展开的极验误判成弹层")
 
+        # --- 12) 包含多张证书时，精准识别所有「有效」证书，跳过失效证书 ---
+        page5 = browser.new_page()
+        multi_cert_html = """
+        <div class="certContent">
+          <div class="certInfoSingle" id="certInfo1">
+            <span class="infoInlineSpan">证书编号 : CERT-001 有效</span>
+          </div>
+          <div class="certInfoSingle" id="certInfo2">
+            <div class="gzsbjyzmzy">该证书不具有证明作用</div>
+            <span class="infoInlineSpan">证书编号 : CERT-002 暂停</span>
+          </div>
+          <div class="certInfoSingle" id="certInfo3">
+            <span class="infoInlineSpan">证书编号 : CERT-003 有效</span>
+          </div>
+          <div class="certInfoSingle" id="certInfo4">
+            <span class="infoInlineSpan">证书编号 : CERT-004 撤销</span>
+          </div>
+        </div>
+        """
+        page5.set_content("<html><body>%s</body></html>" % multi_cert_html)
+        val_cards = h.pick_valid_cert_cards(page5)
+        val_indices = [c["index"] for c in val_cards if c.get("isValid")]
+        ok12 = (val_indices == [1, 3] and len(val_cards) == 4)
+        print("测试12 有效证书精准过滤：%s（有效证书索引=%s / 全部=%d）"
+              % ("通过" if ok12 else "失败", val_indices, len(val_cards)))
+        if not ok12:
+            fails.append("测试12：有效证书过滤逻辑不符合预期")
+
         browser.close()
 
     print()

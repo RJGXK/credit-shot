@@ -140,15 +140,17 @@ class GsxtHandler(PlatformHandler):
                     self.engine.log("  gsxt 首页就绪（第 %d 次尝试）" % rnd)
                 return True
             if rnd < rounds:
-                self.engine.log("  gsxt 首页未就绪，重新加载（第 %d 次）" % (rnd + 1))
+                self.engine.log("  gsxt 首页未就绪，重新通过上级目录跳转进入（第 %d 次）" % (rnd + 1))
                 try:
-                    nav.goto(page, HOME_URLS["gsxt"],
-                             timeout_ms=self.engine.timeout * 1000,
-                             log=self.engine.log)
+                    c2 = nav.goto_via_landing(page, "gsxt", log=self.engine.log,
+                                              timeout_ms=self.engine.timeout * 1000)
+                    if c2.get("page") is not None:
+                        self._gsxt_page = c2["page"]
+                        page = self._gsxt_page
                 except Exception as exc:
-                    self.engine.log("  gsxt 首页打开异常(第%d次)：%s"
+                    self.engine.log("  gsxt 重新跳转异常(第%d次)：%s"
                              % (rnd, str(exc).splitlines()[0][:60]))
-                self.engine.sleep(4.0)
+                self.engine.sleep(3.0)
         # 最后再试一次入口链（第一次可能是瑞数挑战没过）
         if not chain_res.get("ok"):
             self.engine.log("  提示：gsxt 环境校验较慢，继续尝试")
@@ -205,6 +207,12 @@ class GsxtHandler(PlatformHandler):
         page = getattr(self, "_gsxt_page", None) or page
         # 配了账号密码就先自动登录（登录框在主页面里）
         self.try_auto_login(page)
+        # 登录/跳转后页面可能已变化，重新定位实际生效的 gsxt 页面
+        cur = self._locate_active_page(page)
+        if cur is not None:
+            page = cur
+            if cur is not getattr(self, "_gsxt_page", None):
+                self._gsxt_page = cur
         self.engine.log("在 gsxt 首页搜索：%s" % company)
         # 首页可能还在载入态，填入失败就重新加载再试
         filled = False
@@ -221,12 +229,28 @@ class GsxtHandler(PlatformHandler):
         if not filled:
             raise EngineError("gsxt 搜索框定位/填入失败")
         self.engine.sleep(0.8)
-        click_by_text(page, "查 询", exact=False)
-        if not click_by_text(page, "查询", exact=False):
-            page.evaluate("()=>{const b=[...document.querySelectorAll('button,a,input')]"
-                          ".find(e=>(e.innerText||e.value||'').replace(/\\s+/g,'')==='查询');"
-                          "if(b) b.click();}")
-        self.engine.sleep(4)
+        # 精确触发查询按钮：gsxt 首页的搜索按钮是 <button id="btn_query" class="abs search_btn"></button>，
+        # 其 innerText 是空的！不能仅按文本匹配，必须优先精确点击 #btn_query 与 .search_btn。
+        clicked = page.evaluate("""()=>{
+          // 先关闭可能残留的弹窗/模态层
+          const closeBtns = [...document.querySelectorAll('.layui-layer-close, .popup-close, .close, [class*=close]')];
+          for(const c of closeBtns){
+            if(c.offsetWidth > 0 && c.offsetHeight > 0) c.click();
+          }
+          const btn = document.getElementById('btn_query') 
+                   || document.querySelector('.search_btn')
+                   || [...document.querySelectorAll('button, a, input[type=button], input[type=submit]')]
+                      .find(e => /查询|搜索/.test((e.innerText||e.value||e.title||'').trim()));
+          if(!btn) return 'NO_BTN';
+          btn.focus();
+          btn.click();
+          return 'OK:' + (btn.id || btn.className || btn.tagName);
+        }""")
+        self.engine.log("  触发 gsxt 查询按钮：%s" % clicked)
+        if not str(clicked).startswith("OK"):
+            click_by_text(page, "查 询", exact=False)
+            click_by_text(page, "查询", exact=False)
+        self.engine.sleep(3)
 
         self.engine.wait_manual(
             "gsxt 搜索已触发，请完成滑块/验证码，并在弹出的企业列表中选择「%s」进入企业详情页。" % company)
@@ -251,6 +275,10 @@ class GsxtHandler(PlatformHandler):
         所以配了账号密码就自动登录一次。
         登录框在主页面里（不是 iframe），提交后可能弹极验滑块/点选 ——
         那种只能人工，程序会挂起等用户处理。
+
+        登录成功后站点可能整页跳转/重定向，实际生效页面可能变化；
+        这里登录完成后会**重新定位**实际页面并回写 _gsxt_page，
+        保证后续填入操作打在真正的首页上。
         """
         cred = self.engine.credentials.get("gsxt") or {}
         username = (cred.get("username") or "").strip()
@@ -262,9 +290,40 @@ class GsxtHandler(PlatformHandler):
         ok = self.engine.auto_login(page, "gsxt", "国家企业信用信息公示系统")
         if ok:
             self._gsxt_logged_in = True
+            # 登录成功后页面可能整页跳转/重定向，重新定位实际生效页面
+            cur = self._locate_active_page(page)
+            if cur is not None and cur is not page:
+                self._gsxt_page = cur
+                self.engine.log("  登录后页面已切换，重新定位到实际首页")
+            page = cur or page
             # 登录成功会刷新页面，重新等搜索框
-            self.wait_keyword(page, timeout=20)
+            if not self.wait_keyword(page, timeout=20):
+                # 搜索框还没出来：可能被瑞数拦了，重新走上级目录跳转
+                self.engine.log("  ↻ 登录后首页未就绪，重新通过上级目录跳转进入")
+                self.open_portal(page)
         return ok
+
+    def _locate_active_page(self, page):
+        """在浏览器上下文里找 gsxt 的实际页面（优先 #keyword 所在的页）。"""
+        try:
+            pages = list(page.context.pages)
+        except Exception:
+            return None
+        # 1) 找搜索框已就绪的页
+        for p in pages:
+            try:
+                if p.evaluate("()=>!!document.getElementById('keyword')"):
+                    return p
+            except Exception:
+                continue
+        # 2) 找 URL 是 gsxt 的页
+        for p in pages:
+            try:
+                if "gsxt.gov.cn" in (p.url or ""):
+                    return p
+            except Exception:
+                continue
+        return None
 
     def solve_captcha_if_any(self, page) -> bool:
         """页面上有图形验证码时，尝试用打码服务自动过（含刷新重试）。
