@@ -7,10 +7,14 @@ venv/
 .pytest_cache/
 
 # ---- 打包产物（体积大，由 tools/build_exe.py + tools/build_installer.py 重新生成）----
+# build/ 与 dist/ 都是构建输出目录，**不入库**；
+# 最终安装包归档在 release/ 下（走 Git LFS），源码树里不留 dist/
 build/
-# dist/ 下只保留最终安装包入库（走 Git LFS），其余中间产物一律排除
-dist/*
-!dist/企业信用一键截图工具_安装包.exe
+dist/
+
+# release/ 只放对外发布的成品：安装包入库（Git LFS），其余忽略
+release/*
+!release/企业信用一键截图工具_安装包.exe
 
 # ---- 运行时产物（截图、探针输出、界面预览）----
 probe_out/

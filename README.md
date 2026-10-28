@@ -57,6 +57,9 @@ python tools/build_exe.py        :: 生成 dist/企业信用截图工具/
 python tools/build_installer.py  :: 生成 dist/企业信用一键截图工具_安装包.exe
 ```
 
+`build/` 与 `dist/` 都是**构建输出目录，不入版本库**；对外发布的成品归档在
+`release/` 下（安装包走 Git LFS）。
+
 ## 自检
 
 ```bat
@@ -92,7 +95,7 @@ Releases 页提供 Windows 安装包（NSIS 打包，含全部运行时依赖）
 
 安装后双击运行即可，只监听 `127.0.0.1`，浏览器界面与软件窗口均可用。
 
-> 仓库 `dist/` 下的安装包走 [Git LFS](https://git-lfs.com/) 存储，
+> 仓库 `release/` 下的安装包走 [Git LFS](https://git-lfs.com/) 存储，
 > 直接 clone 需执行 `git lfs pull` 才能取到真实文件；
 > 不想装 LFS 客户端的话，直接从 Releases 下载更省事。
 
