@@ -379,15 +379,78 @@ class GsxtHandler(PlatformHandler):
         self.engine.log("  尝试自动登录 gsxt…")
         return bool(self.engine.auto_login(page, "gsxt", "国家企业信用信息公示系统"))
 
+    def _live_page(self, page):
+        """返回一个还活着的 page 对象，避免重试时拿到已关闭/分离的引用，
+        导致整条入口链崩成「Target page, context or browser has been closed」这种
+        让人摸不着头脑的总失败（用户日志 15:11/15:12 的结尾就是它）。"""
+        try:
+            if page is not None and not page.is_closed():
+                # 顺手探一下上下文还在不在
+                _ = page.context
+                return page
+        except Exception:
+            pass
+        try:
+            pages = list(page.context.pages)
+        except Exception:
+            return None
+        # 优先返回还停在 gsxt 域的活页
+        for p in pages:
+            try:
+                if not p.is_closed() and "gsxt.gov.cn" in (p.url or ""):
+                    return p
+            except Exception:
+                continue
+        for p in pages:
+            try:
+                if not p.is_closed():
+                    return p
+            except Exception:
+                continue
+        return None
+
+    def _try_login_first(self, page):
+        """配了账号就先登录再搜：匿名搜索会被 WAF/IP 风控拦截，
+        官方拒绝页也写明「实名注册/登录后再进行访问」；用户自己的浏览器正是登录态才正常。
+
+        返回登录后首页所在 page（登录成功会整页跳回首页）。
+        """
+        self.engine.log("  gsxt：匿名搜索会被系统拦截，先尝试登录"
+                        "（账号密码程序自动填好，滑块/点选需人工过）")
+        try:
+            ok = self.ensure_login(page)
+        except (Aborted, Skipped):
+            raise
+        except Exception as exc:
+            self.engine.log("  自动登录异常：%s" % str(exc).splitlines()[0][:80])
+            ok = False
+        if not ok:
+            self.engine.wait_manual(
+                "gsxt 需要登录才能搜索（匿名搜索被系统拦截）。\n"
+                "账号密码已自动填好，请在浏览器里完成滑块/点选验证并登录，"
+                "登录成功后点【继续】。")
+        self._gsxt_logged_in = True
+        # 登录成功会整页跳回首页；保险地走一次入口链确保停在首页搜索框
+        try:
+            lp = self._live_page(page) or page
+            self.open_portal(lp)
+            page = getattr(self, "_gsxt_page", None) or lp
+        except Exception:
+            pass
+        return page
+
     def enter_detail(self, page, company: str) -> bool:
-        """gsxt：先免登录搜索企业 → 人工过极验并点选企业 → 切到详情新标签页。
+        """gsxt：先登录（配了账号时）→ 搜索企业 → 人工过极验并点选企业 → 切到详情新标签页。
 
         实测流程（2026-10-29）：
           index 页 #keyword 填名称 → #btn_query → 弹极验 → 列表页
           → 点企业**开新标签页**，先是「Environment Checking」白页，
             约 3 秒后自动变成详情页（含「目录导航」「基础信息」）。
-          全程不需要登录。所以**不主动登录**；只有平台自己跳出登录页时才登录，
-          登录完成后重新搜索一次。
+
+        重要修正（v2.2.3）：早期认为「全程不需要登录」，但 2026-10-29 多版实测证明
+        **匿名搜索被 WAF/IP 风控拦截**——点了查询毫无反应，或返回「当前IP请求异常」
+        拒绝页（官方提示本身就是「实名注册/登录后再进行访问」）。用户自己的浏览器正是
+        **登录态**才正常查询。所以现在：配了账号就**先登录再搜**；只有未配账号时才走匿名。
 
         Environment Checking 是瑞数挑战页，**只能等，不能刷新**
         （刷新会重新挑战，用户实测「刷新等 5 秒也还是白页」）。
@@ -402,6 +465,13 @@ class GsxtHandler(PlatformHandler):
             if self._detect_ip_blocked(page):
                 self.engine.log("  ⚠ 仍然被限制，跳过自动查询（按当前画面截图）")
                 return False
+        # 配了账号就先登录再搜：匿名搜索会被 WAF/IP 风控拦截，
+        # 官方拒绝页也写明「实名注册/登录后再进行访问」；用户自己的浏览器正是登录态才正常。
+        # 配了账号却仍走匿名，正是多版「点了查询没反应 / 当前IP请求异常」的根因。
+        if not getattr(self, "_gsxt_logged_in", False):
+            cred = (self.engine.credentials or {}).get("gsxt") or {}
+            if cred.get("username") and cred.get("password"):
+                page = self._try_login_first(page)
         self._search_company(page, company)
         # 点查询后才发现被风控（点了没反应）→ 同样走实名登录/换 IP 的补救，再搜一次
         if getattr(self, "_gsxt_ip_blocked", False):
@@ -503,8 +573,9 @@ class GsxtHandler(PlatformHandler):
                 return
             if attempt > 1:
                 self.engine.log("  ↻ 搜索没有反应，重走入口链再试（第 %d 轮）" % attempt)
-                self.open_portal(page)
-                page = getattr(self, "_gsxt_page", None) or page
+                lp = self._live_page(page) or page
+                self.open_portal(lp)
+                page = getattr(self, "_gsxt_page", None) or lp
                 if self._detect_ip_blocked(page):
                     self._gsxt_ip_blocked = True
                     self._log_ip_blocked()
