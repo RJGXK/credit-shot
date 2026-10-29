@@ -405,29 +405,30 @@ class GsxtHandler(PlatformHandler):
             # 极验可能根本没弹出来（隐藏容器曾导致误判已修，但站点行为会变）：
             # 挂起前先看一眼，没弹就自动**再真实点一次【查询】**，不干等用户。
             if round_no == 1:
+                listing_now = False
+                gt_now = False
                 try:
-                    st = page.evaluate("""()=>{
-                      const els=[...document.querySelectorAll('[class*=geetest],[id*=geetest]')];
-                      const vis=els.some(e=>{
-                        let s=null; try{s=getComputedStyle(e);}catch(err){return false;}
-                        if(s.display==='none'||s.visibility==='hidden') return false;
-                        const b=e.getBoundingClientRect();
-                        return b.width>100&&b.height>60;});
-                      return {vis:vis, url:location.href,
-                              listing:/corp-query-search/.test(location.href)};
-                    }""")
+                    listing_now = bool("/corp-query-search/" in (page.url or ""))
                 except Exception:
-                    st = {}
-                if not st.get("listing") and not st.get("vis"):
+                    listing_now = False
+                try:
+                    gt_now = self._geetest_visible_in(page)
+                except Exception:
+                    gt_now = False
+                if not listing_now and not gt_now:
                     self.engine.log("  ⚠ 验证弹层没有出现，自动再点一次【查询】")
                     self._click_query(page)
                     self._wait_search_reaction(page, timeout=8)
 
             self.engine.wait_manual(
-                "gsxt 已搜索「%s」：请在浏览器里完成验证码/滑块，并在企业列表中点击该企业"
-                "进入详情页（新标签页先显示 Environment Checking，等几秒会自动放行，不要刷新）。\n"
-                "若验证码一直不出现，点【跳过此步】程序会自动重试；"
-                "进入详情页后点【继续】。" % company)
+                "gsxt 已搜索「%s」：\n"
+                "① 请在浏览器里完成验证码/滑块（极验弹窗可能出现在页面中央或独立浮层，"
+                "需要手动拖动/点选）；\n"
+                "② 验证通过后会出现企业列表，点目标企业进入详情页"
+                "（新标签页先显示 Environment Checking，等几秒自动放行，不要刷新）；\n"
+                "③ 若验证码始终不出现，请直接在浏览器里手动点击首页【查询】按钮并拖动滑块，"
+                "程序会持续等待直到出现企业列表/详情页。\n"
+                "完成后点【继续】；想重来可点【跳过此步】。" % company)
             try:
                 pages = list(page.context.pages)
             except Exception:
@@ -454,7 +455,7 @@ class GsxtHandler(PlatformHandler):
                 self._search_company(page, company)
                 continue
 
-            detail = self._wait_detail(pages, timeout=30)
+            detail = self._wait_detail(pages, timeout=60)
             if detail is not None:
                 self._gsxt_page = detail
                 self._gsxt_in_detail = True
@@ -528,7 +529,8 @@ class GsxtHandler(PlatformHandler):
 
             # ---- 点查询 + 验证有反应 ----
             self._click_query(page)
-            if self._wait_search_reaction(page, timeout=6):
+            # 极验弹层常驻独立 iframe，渲染比主页面慢，给足 8s
+            if self._wait_search_reaction(page, timeout=8):
                 reacted = True
                 break
 
@@ -545,7 +547,7 @@ class GsxtHandler(PlatformHandler):
                 page.locator("#keyword").first.press("Enter", timeout=4000)
             except Exception:
                 pass
-            if self._wait_search_reaction(page, timeout=6):
+            if self._wait_search_reaction(page, timeout=8):
                 reacted = True
                 break
             if self._detect_ip_blocked(page):
@@ -659,20 +661,51 @@ class GsxtHandler(PlatformHandler):
         self.engine.log("  触发 gsxt 查询按钮：%s" % clicked)
         return str(clicked)
 
+    @staticmethod
+    def _geetest_visible_in(frame) -> bool:
+        """在单个 frame 里判断 geetest 弹层**真的可见**（不是模板里的隐藏占位）。
+
+        极验的滑块/点选弹层常驻在**独立 iframe**（主页面只留一个隐藏占位容器，
+        所以只查主页面会漏判——表现为「点了查询却说没反应」，重新走入口链）。
+        这里在每个 frame 内分别查，且放宽阈值（尺寸>50×40、匹配更泛的验证提示、
+        或含极验专有结构：图片/滑块/拼图/canvas）。
+        """
+        try:
+            return bool(frame.evaluate("""()=>{
+              const sel='.geetest_holder,.geetest_panel,.geetest_window,.geetest_wind,'
+                      +'[id*=geetest],[class*=geetest],#popup-captcha,.gt_holder,.gt_popup';
+              const els=[...document.querySelectorAll(sel)];
+              return els.some(e=>{
+                let st=null;
+                try{ st=getComputedStyle(e);}catch(err){ return false;}
+                if(st.display==='none'||st.visibility==='hidden'||+st.opacity===0) return false;
+                const b=e.getBoundingClientRect();
+                if(b.width<=50||b.height<=40) return false;
+                // 视口内才算弹层（隐藏模板容器常在文档底部量出巨大尺寸）
+                const vh=window.innerHeight||3000, vw=window.innerWidth||3000;
+                if(b.bottom<0||b.right<0||b.top>vh||b.left>vw) return false;
+                const t=(e.innerText||'');
+                if(/请点击|请依次|点选|拖动|滑块|完成验证|验证|点击图片|拼图|文字|安全验证/.test(t)) return true;
+                if(e.querySelector('img,canvas,.geetest_slider,.geetest_question,.geetest_pic,.gt_slider')) return true;
+                // 极验激活时外层常带 geetest_panel/geetest_show 之类可见子类
+                return !!e.querySelector('.geetest_panel,.geetest_show,.gt_panel,.gt_show');
+              });
+            }"""))
+        except Exception:
+            return False
+
     def _wait_search_reaction(self, page, timeout: float = 6.0) -> bool:
         """等搜索「有反应」：任一标签页跳到结果页，或验证弹层**真的显示**。
 
         之前的问题是点完就 blind sleep(3)，跳没跳转完全不知道，
         用户看到的就是「搜了但不动」。
 
-        实测坑（2026-10-30 用户日志）：点击同一秒就报「✔ 已触发验证」，
-        然后挂起等用户——用户那边什么都没弹，只能点跳过。
-        根因：gsxt 页面模板里常留**隐藏的 geetest 容器**（登录模块
-        `_gsxt_has_geetest` 早有同样记录），`getBoundingClientRect`
-        只量出尺寸、看不出 visibility/display/是否在遮罩层里，
-        导致隐藏容器被误判成「已弹出」。
-        现在复用登录模块的严格判据：display/visibility 正常 + 尺寸足够
-        + 页面上真的有「点选…」这类极验正文。
+        实测坑（2026-10-30 用户日志）：
+        1) 点击同一秒就报「✔ 已触发验证」——根因是主页面那个**隐藏的 geetest
+           占位容器**被量出尺寸误判成已弹出（v2.2.0 已修：加 visibility/size 判据）。
+        2) 但极验激活时弹层常驻**独立 iframe**，主页面只能看到隐藏占位
+           → 又会被判成「没反应」，于是自动重走入口链、用户那边其实弹了却白等。
+           现在改成**跨所有 frame** 检测，且阈值放宽（见 _geetest_visible_in）。
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -686,28 +719,15 @@ class GsxtHandler(PlatformHandler):
                         return True
             except Exception:
                 pass
+            # 跨 frame 检测极验弹层（含极验专属 iframe）
             try:
-                has_gt = page.evaluate("""()=>{
-                  const els=[...document.querySelectorAll(
-                    '.geetest_holder,.geetest_panel,.geetest_window,[id*=geetest],[class*=geetest],#popup-captcha')];
-                  return els.some(e=>{
-                    let st=null;
-                    try{ st=getComputedStyle(e);}catch(err){ return false;}
-                    if(st.display==='none'||st.visibility==='hidden'||+st.opacity===0) return false;
-                    const b=e.getBoundingClientRect();
-                    if(b.width<=100||b.height<=60) return false;
-                    // 视口内才算弹层（隐藏模板容器常在文档底部量出巨大尺寸）
-                    if(b.bottom<0||b.right<0||
-                       b.top>(window.innerHeight||9999)||b.left>(window.innerWidth||9999)) return false;
-                    const t=(e.innerText||'');
-                    return /请点击|请依次|点选|拖动滑块|完成验证|验证码/.test(t) || !!e.querySelector('img');
-                  });
-                }""")
-                if has_gt:
+                frames = list(page.frames)
+            except Exception:
+                frames = [page]
+            for fr in frames:
+                if self._geetest_visible_in(fr):
                     self.engine.log("  ✔ 已触发验证（极验/图形验证码）")
                     return True
-            except Exception:
-                pass
             self.engine.sleep(0.5)
         return False
 
