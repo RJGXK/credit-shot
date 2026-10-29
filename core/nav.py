@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 from core.errors import Aborted, Skipped
@@ -433,7 +434,7 @@ def _enter_via_search(page, search_url: str, name_hint: str,
         return None
     nap(2.0)
 
-    js = """
+    js_find = """
     (arg)=>{
       const norm=s=>(s||'').replace(/\\s+/g,'');
       const as=[...document.querySelectorAll('a[href]')].filter(a=>{
@@ -454,16 +455,48 @@ def _enter_via_search(page, search_url: str, name_hint: str,
       // 3) 文字命中站名（搜索引擎的跳转链接 href 是加密的，只能看文字）
       if(!hit && arg.hint) hit=as.find(a=>norm(a.innerText).indexOf(norm(arg.hint))>=0);
       if(!hit) return 'NONE';
-      hit.click();
-      return 'CLICK:'+(hit.href||'').slice(0,90);
+      // 先滚到可视区，再取「点击中心」的视口坐标（page.mouse.click 用的是视口坐标）
+      hit.scrollIntoView({block:'center'});
+      const b=hit.getBoundingClientRect();
+      return JSON.stringify({href:(hit.href||'').slice(0,200),
+                             cx:b.left+b.width/2, cy:b.top+b.height/2,
+                             w:Math.round(b.width), h:Math.round(b.height)});
     }
     """
     try:
-        r = str(page.evaluate(js, {"host": expect_host, "hint": name_hint}))
+        r = page.evaluate(js_find, {"host": expect_host, "hint": name_hint})
+        data = json.loads(r) if isinstance(r, str) and r.startswith("{") else None
     except Exception as exc:
-        r = "ERR:%s" % str(exc).splitlines()[0][:60]
-    log("  搜索结果点击：%s" % r[:100])
-    if not r.startswith("CLICK"):
+        data = None
+        log("  ⚠ 搜索结果解析失败：%s" % str(exc).splitlines()[0][:60])
+    if not data:
+        log("  ⚠ 搜索结果中没找到「%s」的入口链接（可能被拦或页面结构变化）"
+            % (name_hint or expect_host))
+        return None
+    log("  搜索结果命中：%s（中心 %d,%d 尺寸 %dx%d）"
+        % (data.get("href", "")[:90], data.get("cx"), data.get("cy"),
+           data.get("w"), data.get("h")))
+
+    # 真实鼠标点击（规避合成 .click() 被 WAF/极验判成自动化）——
+    # 用户自己的浏览器用真实点击能进，软件用合成点击被拦，根因就在这里。
+    clicked = False
+    try:
+        page.mouse.click(data["cx"], data["cy"])
+        clicked = True
+        log("  ✔ 已用真实鼠标点击搜索结果")
+    except Exception as exc:
+        log("  ⚠ 真实点击失败（%s），回落合成点击" % str(exc).splitlines()[0][:50])
+    if not clicked:
+        try:
+            page.evaluate("""(href)=>{
+              const a=[...document.querySelectorAll('a[href]')]
+                .find(x=>(x.href||'').indexOf(href)>=0);
+              if(a) a.click();
+            }""", data.get("href", ""))
+            clicked = True
+        except Exception:
+            pass
+    if not clicked:
         return None
 
     # 等落地：可能当前页直接跳走，也可能开了新标签页（target=_blank）
@@ -501,7 +534,7 @@ def _enter_via_search(page, search_url: str, name_hint: str,
                     % str(getattr(newp, "url", "") or "")[:80])
                 return newp
         nap(1.5)
-    log("  ⚠ 搜索结果没有跳到目标站（可能被拦或链接失效）")
+    log("  ⚠ 搜索结果点击后没有跳到目标站（可能被拦或链接失效）")
     return None
 
 

@@ -409,35 +409,67 @@ class GsxtHandler(PlatformHandler):
                 continue
         return None
 
+    def _gsxt_is_logged_in(self, page) -> bool:
+        """首页上是否已处于登录态：出现「退出登录/个人中心/欢迎您」等字样即视为已登录。
+
+        软件浏览器复用同一份资料目录，登录态会落在 cookie 里持久化，
+        所以第二次运行（或同一次运行内后续主体）常常已经登录，不必再走一遍登录。
+        """
+        try:
+            return bool(page.evaluate("""()=>{
+              const t=(document.body&&document.body.innerText)||'';
+              if(/退出登录|个人中心|欢迎您|已登录|用户中心|我的关注/.test(t)) return true;
+              return false;
+            }"""))
+        except Exception:
+            return False
+
+    def _after_login_enter(self, page):
+        """登录后重新进入首页搜索框（登录成功会整页跳回首页）。"""
+        try:
+            lp = self._live_page(page) or page
+            self.open_portal(lp)
+            return getattr(self, "_gsxt_page", None) or lp
+        except Exception as exc:
+            self.engine.log("  ⚠ 登录后重新进入首页失败：%s"
+                            % str(exc).splitlines()[0][:60])
+            return page
+
     def _try_login_first(self, page):
         """配了账号就先登录再搜：匿名搜索会被 WAF/IP 风控拦截，
         官方拒绝页也写明「实名注册/登录后再进行访问」；用户自己的浏览器正是登录态才正常。
 
-        返回登录后首页所在 page（登录成功会整页跳回首页）。
+        关键修正（v2.2.4）：不再死循环弹验证码。软件浏览器极易被极验反复挑战，
+        自动过码往往过不去；所以「自动填好账号密码 + 一次人工过码挂起」后若仍没登录成功，
+        就直接交给用户兜底（用户在浏览器里手动登录后点继续），绝不循环弹验证码。
         """
+        # 已经登录（同进程内前面已登录过 / 资料目录里带着登录态）→ 直接跳过
+        if getattr(self, "_gsxt_logged_in", False) or self._gsxt_is_logged_in(page):
+            self.engine.log("  gsxt：当前已是登录态，跳过自动登录")
+            self._gsxt_logged_in = True
+            return page
         self.engine.log("  gsxt：匿名搜索会被系统拦截，先尝试登录"
                         "（账号密码程序自动填好，滑块/点选需人工过）")
+        ok = False
         try:
             ok = self.ensure_login(page)
         except (Aborted, Skipped):
             raise
         except Exception as exc:
             self.engine.log("  自动登录异常：%s" % str(exc).splitlines()[0][:80])
-            ok = False
-        if not ok:
-            self.engine.wait_manual(
-                "gsxt 需要登录才能搜索（匿名搜索被系统拦截）。\n"
-                "账号密码已自动填好，请在浏览器里完成滑块/点选验证并登录，"
-                "登录成功后点【继续】。")
+        if ok:
+            self.engine.log("  ✔ gsxt 自动登录成功（已进入登录态）")
+            self._gsxt_logged_in = True
+            return self._after_login_enter(page)
+        # 登录没能自动完成（极验在软件浏览器里常反复挑战）：交给用户一次性兜底。
+        self.engine.wait_manual(
+            "gsxt 需要登录才能搜索（匿名搜索被系统拦截）。\n"
+            "账号密码已由程序自动填好：请在浏览器里完成滑块/点选验证并登录，"
+            "登录成功（跳回公示系统首页）后点【继续】。\n"
+            "如果验证码一直过不去，可改用你自己的浏览器先登录一次，"
+            "本软件会复用资料目录里的登录态，之后就不再需要过码。")
         self._gsxt_logged_in = True
-        # 登录成功会整页跳回首页；保险地走一次入口链确保停在首页搜索框
-        try:
-            lp = self._live_page(page) or page
-            self.open_portal(lp)
-            page = getattr(self, "_gsxt_page", None) or lp
-        except Exception:
-            pass
-        return page
+        return self._after_login_enter(page)
 
     def enter_detail(self, page, company: str) -> bool:
         """gsxt：先登录（配了账号时）→ 搜索企业 → 人工过极验并点选企业 → 切到详情新标签页。
@@ -458,6 +490,8 @@ class GsxtHandler(PlatformHandler):
         if getattr(self, "_gsxt_in_detail", False):
             return True
         ok_portal = self.open_portal(page)
+        self.engine.log("  入口链结果：ok_portal=%s，_gsxt_ip_blocked=%s"
+                        % (ok_portal, getattr(self, "_gsxt_ip_blocked", False)))
         page = getattr(self, "_gsxt_page", None) or page
         # 首页没起来（风控 / 票据判废 / 空白页）都走补救：清票据 → 重进 → 必要时登录
         if not ok_portal or getattr(self, "_gsxt_ip_blocked", False):
@@ -581,6 +615,13 @@ class GsxtHandler(PlatformHandler):
                     self._log_ip_blocked()
                     return
             self.engine.log("在 gsxt 首页搜索：%s" % company)
+            # 确认现在确实停在 gsxt 首页（而不是卡在 Bing/搜索结果页——
+            # 那样点查询当然没反应，必须先回到入口链）
+            try:
+                cur_url = str(page.evaluate("()=>location.href") or "")
+            except Exception:
+                cur_url = "<无法读取>"
+            self.engine.log("  当前页面：%s" % cur_url[:96])
 
             # 等页面完全加载（geetest 与站点脚本绑定完再点，否则点了没反应）
             try:
@@ -610,13 +651,17 @@ class GsxtHandler(PlatformHandler):
                 self.engine.log("  ⚠ 搜索框定位/填入失败，进入下一轮重试")
                 continue
             self.engine.sleep(0.8)
+            self.engine.log("  填词结果：%s；准备点击【查询】" % ("OK" if filled else "失败"))
 
             # ---- 点查询 + 验证有反应 ----
             self._click_query(page)
             # 极验弹层常驻独立 iframe，渲染比主页面慢，给足 8s
             if self._wait_search_reaction(page, timeout=8):
                 reacted = True
+                self.engine.log("  ✔ 点查询后有反应（已跳转或已弹验证）")
                 break
+            else:
+                self.engine.log("  ⚠ 点查询后 8s 内既没跳转、也没弹出验证层")
 
             # 点完毫无反应时先确认是不是被风控——是就不再做任何
             # 「真实点击 / 回车 / 重走入口链」，那些动作会加重 IP 风控。

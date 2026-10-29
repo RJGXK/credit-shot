@@ -848,16 +848,12 @@ def _login_gsxt(page, username: str, password: str, log: LogFn,
     if state2 == "badcred":
         return LoginResult(reason=msg2, filled=True, bad_credentials=True)
     if state2 == "captcha":
-        # 验证面板还在 —— 多半是用户没真正过码，再给一次机会
-        log("  ⏸ 验证面板还在，请再完成一次验证")
-        wait_captcha(prompt)
-        state3, msg3 = _gsxt_wait_result(page, log, seconds=60)
-        if state3 == "ok":
-            log("  ✔ 人工补完验证后登录成功（%s）" % msg3)
-            return LoginResult(ok=True, reason=msg3, filled=True)
-        if state3 == "badcred":
-            return LoginResult(reason=msg3, filled=True, bad_credentials=True)
-        return LoginResult(reason="验证码后仍未确认登录结果", filled=True,
+        # 验证面板还在：软件浏览器很容易被极验反复挑战（bot 指纹），
+        # 再弹一次验证码往往还是过不去——用户反馈的「一直循环」就来自这里。
+        # 这里不再循环弹验证码，直接交回上层：上层用一次「请手动登录后继续」的
+        # 挂起让用户兜底，然后放行，避免死循环。
+        log("  ⚠ 极验验证面板仍在（软件浏览器易被极验反复挑战），转交人工兜底")
+        return LoginResult(reason="验证面板仍在，需人工在浏览器完成", filled=True,
                            needs_captcha=True)
 
     log("  ⚠ 登录后没有等到明确结果")
