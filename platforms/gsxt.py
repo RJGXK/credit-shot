@@ -158,6 +158,7 @@ class GsxtHandler(PlatformHandler):
             self.engine.log("  已切换到 gsxt 新标签页")
         # 后续所有等待/操作都打在**实际生效的那个页面**上
         page = self._gsxt_page or page
+        cleared_once = False
         for rnd in range(1, rounds + 1):
             # IP 被风控时首页根本出不来（点查询也只会毫无反应）：
             # 必须立刻停手，反复重走入口链只会被判得更死。
@@ -197,11 +198,23 @@ class GsxtHandler(PlatformHandler):
                 return False
             # 静默 400/白页也要兜住：站点判废票据时不一定给提示文案，
             # 有时就是一张空白页（HTTP 400 + 无正文）。
+            # 但要区分两种「没读出来」：
+            #   · nav_state 返回空 dict（evaluate 抛异常）→ 多半是页面正在做瑞数
+            #     重定向挑战、执行上下文被打掉（复用旧进程时常见），这不算「空白页」，
+            #     别急着清票据（清了反而可能把刚拿到的会话冲掉），直接重走入口链即可；
+            #   · 真有正文但太短 / 被判拒绝 → 才是旧票据判废，清票据重试。
+            # 两种情况都只在首次出现时清一次，避免每轮都清、把会话越清越死。
             st = nav.nav_state(page)
-            if (rnd == 1 and not st.get("checking")
-                    and (st.get("blank") or st.get("len", 0) < 60)):
-                self.engine.log("  ⚠ 首页空白/被拒（可能旧会话票据被判废），清票据后重试")
+            genuine_blank = bool(st) and "len" in st and not st.get("checking") \
+                and (st.get("blank") or st.get("len", 0) < 60)
+            unhealthy = not bool(st)  # evaluate 抛异常：页面不可读
+            if (genuine_blank or unhealthy) and not cleared_once:
+                if genuine_blank:
+                    self.engine.log("  ⚠ 首页空白/被拒（可能旧会话票据被判废），清票据后重试")
+                else:
+                    self.engine.log("  ⚠ 首页读取异常（页面可能正在做环境挑战），清票据后重试")
                 self._clear_site_cookies(page)
+                cleared_once = True
                 self.engine.sleep(1.5)
                 # 不 continue：让下面的「重走入口链」分支把页面重新带起来
             if rnd < rounds:

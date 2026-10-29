@@ -541,14 +541,54 @@ def goto_via_landing(page, site_key: str, log=print,
                     landed.bring_to_front()
                 except Exception:
                     pass
-                st = _wait_ready_patient(landed, timeout=12.0)
-                log("  搜索引擎落地：len=%s blank=%s checking=%s"
-                    % (st.get("len"), st.get("blank"), st.get("checking")))
-                # **host 对上就算进来了**：正文可能还在跑瑞数/加速乐的环境挑战，
-                # 交给调用方去等真正的就绪条件（gsxt 等 #keyword，最多 18s×N 轮）。
-                # 以前这里要求 len>200 才返回，挑战页会把刚点进来的页面判失败，
-                # 整条链继续往下走，反而把已经到手的页面丢了。
-                return {"ok": True, "state": st, "via": "search", "page": landed}
+                # 即时健康探针：复用旧进程时，搜索链开的「新标签页」偶尔会卡在瑞数
+                # 挑战循环里，页面执行上下文一直被打掉、evaluate 一上来就抛异常。
+                # 这种立刻回落到落地链，别傻等十几秒（新进程正常时这里能读到页面，
+                # 不会误判）。
+                _early = nav_state(landed)
+                if not _early:
+                    if landed is not page:
+                        try:
+                            landed.close()
+                        except Exception:
+                            pass
+                    log("  搜索引擎新标签页不可读（疑似旧进程挑战循环），回落到落地链")
+                    last = {"ok": False, "reason": "搜索引擎新标签页不可读"}
+                    continue
+                # 耐心等落地页真正可用。gsxt 的瑞数挑战会反复做「环境检测→重定向」，
+                # 期间 page.evaluate 常抛「Execution context was destroyed」——属正常，
+                # 继续等即可，不要急着判失败。复用旧进程时搜索链开的新标签页偶尔会卡在
+                # 挑战循环里（执行上下文一直被打掉），这种就别死等，尽快回落到落地链。
+                st = _wait_ready_patient(landed, timeout=10.0)
+                ready = (isinstance(st.get("len"), int)
+                         and st.get("len", 0) > 200
+                         and not st.get("blank")
+                         and not st.get("checking")
+                         and not st.get("denied"))
+                # 正文检测不到但搜索框其实已在（gsxt 首页 #keyword 一定存在）：
+                # 再补一次定向等待，避免把「已就绪」误判成「没进来」。
+                if not ready:
+                    try:
+                        landed.wait_for_selector("#keyword", state="visible",
+                                                timeout=8000)
+                        ready = True
+                    except Exception:
+                        ready = False
+                log("  搜索引擎落地：len=%s blank=%s checking=%s ready=%s"
+                    % (st.get("len"), st.get("blank"),
+                       st.get("checking"), ready))
+                if ready:
+                    return {"ok": True, "state": st, "via": "search",
+                            "page": landed}
+                # 没真正就绪：别谎报成功。关掉这个半加载的挑战页，继续走下一条
+                # 入口链（百度搜索 / 政府门户链 / 兜底直连），给别的进入方式机会。
+                if landed is not page:
+                    try:
+                        landed.close()
+                    except Exception:
+                        pass
+                last = {"ok": False, "reason": "搜索引擎入口未真正就绪"}
+                continue
             last = {"ok": False, "reason": "搜索引擎入口未成功"}
             continue
 
