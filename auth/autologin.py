@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -548,53 +549,104 @@ def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
 def _gsxt_fill(page, username: str, password: str) -> str:
     """填 gsxt 登录框：#UserName（手机号/身份证号）+ #gsxtp（密码）。
 
-    这里用 eval_retry 而不是 _js_action：需要拿到脚本返回的**具体字符串**
-    （"OK/OK" 表示两个框都填成功），而 wait_for_function 只会返回 True。
+    关键修复（用户反馈「手动能登、软件一直弹验证码」直接命中）：
+    旧实现用原生 setter **一次性把整串值灌进输入框**，没有任何逐字符的
+    keydown/keypress/keyup 事件、也没有字符间隔——极验/瑞验的行为式风控
+    直接判成机器人，于是反复弹验证码、永远过不去。本人手敲能过正是因为它
+    产生的是真实键盘事件流（每字符一次 keydown→keyup、间隔 60~180ms）。
+
+    现在改为 **逐字符真实键盘输入**（Playwright keyboard.type，每个字符都产生
+    真实的 keydown/keypress/keyup/input 事件，并带拟人随机间隔），与真人手敲一致。
+    填完回读校验；个别极端字符 type 失败或不匹配时，再回落 setter 兜底（仅该字段）。
     """
-    js = """
-    (arg)=>{
-      const set=(id,v)=>{
-        const e=document.getElementById(id);
-        if(!e) return 'NO_'+id;
-        e.focus();
-        const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-        s.call(e,v);
-        e.dispatchEvent(new Event('input',{bubbles:true}));
-        e.dispatchEvent(new Event('change',{bubbles:true}));
-        return e.value===v ? 'OK' : 'SET_FAIL';
-      };
-      return [set('UserName',arg.u), set('gsxtp',arg.p)].join('/');
-    }
-    """
-    try:
-        from core.page import eval_retry
-        r = eval_retry(page, js, {"u": username, "p": password}, tries=3, delay=0.8)
-    except Exception:
-        return ""
-    return r if isinstance(r, str) else ""
+
+    def _type(selector, text, field_name):
+        # 真实鼠标点击聚焦输入框
+        try:
+            el = page.wait_for_selector(selector, timeout=6000)
+            if el is None:
+                return "NO_" + field_name
+            el.click(timeout=4000)
+            time.sleep(random.uniform(0.15, 0.35))
+            # 清空旧值（真实快捷键）
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+            time.sleep(random.uniform(0.1, 0.25))
+        except Exception:
+            return "NO_" + field_name
+
+        for ch in text:
+            try:
+                page.keyboard.type(ch, delay=0)   # 真实键盘事件流
+            except Exception:
+                # 极少数字符（特殊符号）type 失败，走 setter 补一字符
+                try:
+                    page.evaluate(
+                        "([sel,c])=>{const e=document.querySelector(sel);"
+                        "if(!e)return;const s=Object.getOwnPropertyDescriptor("
+                        "window.HTMLInputElement.prototype,'value').set;"
+                        "s.call(e,e.value+c);"
+                        "e.dispatchEvent(new Event('input',{bubbles:true}));}",
+                        [selector, ch])
+                except Exception:
+                    pass
+            time.sleep(random.uniform(0.06, 0.18))   # 拟人间隔
+        # 触发 blur -> change
+        try:
+            page.keyboard.press("Tab")
+        except Exception:
+            pass
+        # 回读校验
+        try:
+            val = page.evaluate(
+                "(sel)=>{const e=document.querySelector(sel);return e?e.value:'';}",
+                selector)
+        except Exception:
+            val = None
+        if val == text:
+            return "OK"
+        # 兜底：setter 整体赋值（仅在极端场景触发，会损失拟人信号但保证能填）
+        try:
+            ok = page.evaluate(
+                "([sel,v])=>{const e=document.querySelector(sel);if(!e)return false;"
+                "const s=Object.getOwnPropertyDescriptor("
+                "window.HTMLInputElement.prototype,'value').set;"
+                "s.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));"
+                "e.dispatchEvent(new Event('change',{bubbles:true}));"
+                "return e.value===v;}", [selector, text])
+            if ok:
+                return "OK"
+        except Exception:
+            pass
+        return "SET_FAIL"
+
+    res_u = _type("#UserName", username, "UserName")
+    time.sleep(random.uniform(0.2, 0.5))
+    res_p = _type("#gsxtp", password, "gsxtp")
+    return "%s/%s" % (res_u, res_p)
 
 
 def _gsxt_submit(page) -> bool:
-    """点 gsxt 登录按钮 #btn_login。"""
-    js = """
-    ()=>{
-      const b=document.getElementById('btn_login');
-      if(!b) return false;
-      b.focus();
-      b.click();
-      return true;
-    }
+    """点 gsxt 登录按钮 #btn_login。
+
+    用 Playwright 的**真实鼠标点击**（不是 JS 合成 click）——合成 click 没有
+    真实 mousedown/mouseup/click 事件序列，易被极验行为式风控判成自动化。
+    回落才用 JS 点击。
     """
-    ok = bool(_js_action(page, js, timeout=4000))
-    if not ok:
-        try:
-            b = page.query_selector("#btn_login")
-            if b:
-                b.click()
-                return True
-        except Exception:
-            pass
-    return ok
+    try:
+        btn = page.wait_for_selector("#btn_login", timeout=6000)
+        if btn is None:
+            return False
+        btn.click(timeout=5000)   # 真实鼠标点击
+        return True
+    except Exception:
+        pass
+    try:
+        return bool(_js_action(page, "()=>{const b=document.getElementById('btn_login');"
+                                    "if(!b)return false;b.focus();b.click();return true;}",
+                                timeout=4000))
+    except Exception:
+        return False
 
 
 def _gsxt_judge(page, log: LogFn):
@@ -782,6 +834,8 @@ def _login_gsxt(page, username: str, password: str, log: LogFn,
         return LoginResult(reason="登录表单没找到账号/密码输入框")
     log("  ✔ 账号密码已自动填入 gsxt 登录框")
 
+    # 拟人节奏：填完稍作停顿再提交（真人不会填完瞬间点登录，瞬时提交也会被风控）
+    time.sleep(random.uniform(0.6, 1.4))
     if not _gsxt_submit(page):
         log("  ⚠ 没找到登录按钮")
         return LoginResult(reason="没找到登录按钮", filled=True)
