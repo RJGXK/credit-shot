@@ -9,12 +9,13 @@
 """
 from __future__ import annotations
 
+import random
 import time
 from typing import Any, Callable, Optional
 
 __all__ = [
     "fill_controlled", "set_native", "click_by_text", "wait_text",
-    "wait_ready", "eval_retry", "read_text", "js_action",
+    "wait_ready", "eval_retry", "read_text", "js_action", "type_human",
 ]
 
 
@@ -108,6 +109,44 @@ def fill_controlled(page, js_finder: str, value: str) -> bool:
     except Exception:
         return False
     return str(cur).strip() == value.strip()
+
+
+def type_human(page, finder_js: str, text: str, *,
+                min_delay: float = 0.06, max_delay: float = 0.18,
+                clear_first: bool = True) -> Optional[str]:
+    """逐字符真实键盘输入（拟人节奏），返回输入框最终值（供回读校验），失败返回 None。
+
+    用途：填企业名称 / 账号密码这类**会被行为式风控采集按键节奏**的输入框。
+    一次性 setter 灌值没有逐字符的 keydown/keyup、没有字符间隔，极验/瑞验会直接
+    判成机器人（用户实测：软件自动登录一直弹验证码，手动慢敲就能过）。
+
+    这里每字符走 ``keyboard.type(ch)``，产生真实 keydown→keyup→input 事件流，
+    字符间带 60~180ms 随机间隔，与真人手敲一致；填完回读最终值。
+    """
+    try:
+        handle = page.evaluate_handle(finder_js)
+        el = handle.as_element()
+        if el is None:
+            return None
+        el.click(timeout=3000)
+        time.sleep(random.uniform(0.15, 0.3))
+        if clear_first:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+            time.sleep(0.12)
+        for ch in text:
+            try:
+                page.keyboard.type(ch, delay=0)
+            except Exception:
+                pass
+            time.sleep(random.uniform(min_delay, max_delay))
+        try:
+            page.keyboard.press("Tab")   # 触发 blur -> change
+        except Exception:
+            pass
+        return el.evaluate("e => e.value")
+    except Exception:
+        return None
 
 
 def set_native(page, js_finder: str, value: str) -> bool:

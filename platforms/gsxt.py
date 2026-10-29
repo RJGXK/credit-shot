@@ -11,7 +11,7 @@ import time
 
 from core.errors import EngineError
 from core.page import (click_by_text, eval_retry, fill_controlled,
-                     set_native, wait_text)
+                     set_native, wait_text, type_human)
 from core import nav
 from config import HOME_URLS, MODE_PERSON
 from core.errors import Aborted, EngineError, Skipped
@@ -34,6 +34,100 @@ class GsxtHandler(PlatformHandler):
         self._gsxt_page = None
         self._gsxt_logged_in = False
         self._gsxt_ip_blocked = False
+
+    def _walk_detail_sidebar(self, page) -> int:
+        """详情页左侧「目录导航」逐级展开并点击，触发所有板块的懒加载。
+
+        用户要求「所有信息」都要截到：侧边栏**大项**展开 → **小分项** → 详情。
+        站点 SPA 里多数板块是「点目录项才渲染/才显示」的，不点开整页截图就会缺内容。
+
+        实现：每轮先收集左侧导航里所有可点击条目标题（大项与小分项），点掉一个未见过的，
+        再重新收集（点开大项后小分项才出现），如此反复直到全部点过或达上限。
+        纯防御：任一环节失败都不抛，只记录；最后滚回顶部。返回实际点击条数。
+        """
+        try:
+            has_nav = page.evaluate("""()=>{
+              const norm=s=>(s||'').replace(/\\s+/g,'').trim();
+              return [...document.querySelectorAll('div,span,h1,h2,h3,p,a,label')]
+                .some(e=>norm(e.innerText||e.textContent||'')==='目录导航');
+            }""")
+        except Exception:
+            has_nav = False
+        if not has_nav:
+            self.engine.log("  ⚠ 未找到「目录导航」，跳过侧边栏遍历")
+            return 0
+
+        def _collect():
+            try:
+                return page.evaluate("""()=>{
+                  const W=window.innerWidth;
+                  const norm=s=>(s||'').replace(/\\s+/g,'').trim();
+                  const t=[...document.querySelectorAll('div,span,h1,h2,h3,p,a,label')]
+                    .find(e=>norm(e.innerText||e.textContent||'')==='目录导航');
+                  if(!t) return [];
+                  let root=t;
+                  for(let i=0;i<7 && root.parentElement;i++){root=root.parentElement;
+                    if(root.querySelectorAll('a,li,span,div').length>=8) break;}
+                  return [...root.querySelectorAll('a,span,div,li,em,i,label')]
+                    .filter(e=>{const r=e.getBoundingClientRect();
+                      if(r.width<=0||r.height<=0) return false;
+                      if(r.x>=W*0.35) return false;     // 只取左侧导航
+                      const tx=norm(e.innerText||e.textContent||'');
+                      return tx && tx.length<30 && tx!=='目录导航';})
+                    .map(e=>norm(e.innerText||e.textContent||''));
+                }""")
+            except Exception:
+                return []
+
+        def _click_one(kw):
+            try:
+                return page.evaluate("""(kw)=>{
+                  const W=window.innerWidth;
+                  const norm=s=>(s||'').replace(/\\s+/g,'').trim();
+                  const t=[...document.querySelectorAll('div,span,h1,h2,h3,p,a,label')]
+                    .find(e=>norm(e.innerText||e.textContent||'')==='目录导航');
+                  if(!t) return 'NONE';
+                  let root=t;
+                  for(let i=0;i<7 && root.parentElement;i++){root=root.parentElement;
+                    if(root.querySelectorAll('a,li,span,div').length>=8) break;}
+                  const els=[...root.querySelectorAll('a,span,div,li,em,i,label')]
+                    .filter(e=>{const r=e.getBoundingClientRect();
+                      return r.width>0&&r.height>0&&r.x<W*0.35&&
+                        norm(e.innerText||e.textContent||'')===kw;});
+                  if(!els.length) return 'NONE';
+                  els.sort((a,b)=>norm(a.innerText||a.textContent||'').length
+                                  -norm(b.innerText||b.textContent||'').length);
+                  els[0].scrollIntoView({block:'center'});
+                  els[0].click();
+                  return 'CLICK:'+kw;
+                }""", kw)
+            except Exception as exc:
+                return "ERR:%s" % str(exc).splitlines()[0][:40]
+
+        seen = set()
+        clicked = 0
+        MAX = 24
+        for _ in range(MAX + 6):
+            items = _collect()
+            target = None
+            for it in items:
+                if it and it not in seen:
+                    target = it
+                    break
+            if target is None:
+                break
+            seen.add(target)
+            r = _click_one(target)
+            if str(r).startswith("CLICK"):
+                clicked += 1
+                self.engine.log("  侧边栏展开/点击：%s" % target)
+            self.engine.sleep(0.7)
+        # 遍历完滚回顶部，避免最后停留位置影响整页截图
+        try:
+            page.evaluate("()=>window.scrollTo(0,0)")
+        except Exception:
+            pass
+        return clicked
 
     def collect_group(self, page, company: str, gsteps: list,
                             results: List[StepResult], shots: List[str]) -> None:
@@ -78,6 +172,12 @@ class GsxtHandler(PlatformHandler):
             if str(r).startswith("CLICK"):
                 self.engine.log("  左侧目录「%s」：%s" % (kw, r))
             self.engine.sleep(1.2)
+
+        # 逐级展开侧边栏（大项→小分项），触发所有板块的懒加载，
+        # 这样「所有信息」都能进入 DOM 被整页截到（用户要求）。
+        n = self._walk_detail_sidebar(page)
+        self.engine.log("  侧边栏逐级展开完成，共点击 %d 项" % n)
+        self.engine.sleep(1.5)
 
         # 详情页板块内容是**滚动懒加载**：没滚到过的板块 DOM 里是空的，
         # 整页截图时那些板块就缺失了（用户实测「四个板块没法同时展示」）。
@@ -435,20 +535,39 @@ class GsxtHandler(PlatformHandler):
                             % str(exc).splitlines()[0][:60])
             return page
 
-    def _try_login_first(self, page):
-        """配了账号就先登录再搜：匿名搜索会被 WAF/IP 风控拦截，
-        官方拒绝页也写明「实名注册/登录后再进行访问」；用户自己的浏览器正是登录态才正常。
+    def _login_succeeded(self, page) -> bool:
+        """登录是否成功：URL 已离开 shiming 登录子站（跳回 gsxt 首页），
+        或登录表单（#UserName）已不在页面上。"""
+        try:
+            cur = page.url or ""
+        except Exception:
+            cur = ""
+        if cur and "shiming.gsxt.gov.cn" not in cur and "gsxt.gov.cn" in cur:
+            return True
+        try:
+            if not page.evaluate("()=>!!document.getElementById('UserName')"):
+                return True
+        except Exception:
+            pass
+        return False
 
-        关键修正（v2.2.4）：不再死循环弹验证码。软件浏览器极易被极验反复挑战，
-        自动过码往往过不去；所以「自动填好账号密码 + 一次人工过码挂起」后若仍没登录成功，
-        就直接交给用户兜底（用户在浏览器里手动登录后点继续），绝不循环弹验证码。
+    def _try_login_first(self, page):
+        """登录（仅在匿名搜索被拦时才调用）：先自动填+过码，没成则交用户手动登录。
+
+        关键修正（v2.2.4→v2.2.6）：
+          · 用户反馈「账号密码手动输入可以登录，但软件自动登录一直弹验证码」——
+            软件浏览器极易被极验反复挑战，自动过码常过不去。于是这里**绝不软件自动死循环弹码**，
+            自动没过就交用户手动登录（用户已确认手动可用），并做成功回检。
+          · 手动兜底是有界重试（最多 3 次 wait_manual），每次点【继续】后回检
+            是否真的登录成功；不像旧版那样无限循环弹验证码。
         """
         # 已经登录（同进程内前面已登录过 / 资料目录里带着登录态）→ 直接跳过
-        if getattr(self, "_gsxt_logged_in", False) or self._gsxt_is_logged_in(page):
+        if getattr(self, "_gsxt_logged_in", False) or self._gsxt_is_logged_in(page) \
+                or self._login_succeeded(page):
             self.engine.log("  gsxt：当前已是登录态，跳过自动登录")
             self._gsxt_logged_in = True
             return page
-        self.engine.log("  gsxt：匿名搜索会被系统拦截，先尝试登录"
+        self.engine.log("  gsxt：匿名搜索被拦，尝试登录"
                         "（账号密码程序自动填好，滑块/点选需人工过）")
         ok = False
         try:
@@ -461,15 +580,26 @@ class GsxtHandler(PlatformHandler):
             self.engine.log("  ✔ gsxt 自动登录成功（已进入登录态）")
             self._gsxt_logged_in = True
             return self._after_login_enter(page)
-        # 登录没能自动完成（极验在软件浏览器里常反复挑战）：交给用户一次性兜底。
-        self.engine.wait_manual(
-            "gsxt 需要登录才能搜索（匿名搜索被系统拦截）。\n"
-            "账号密码已由程序自动填好：请在浏览器里完成滑块/点选验证并登录，"
-            "登录成功（跳回公示系统首页）后点【继续】。\n"
-            "如果验证码一直过不去，可改用你自己的浏览器先登录一次，"
-            "本软件会复用资料目录里的登录态，之后就不再需要过码。")
+
+        # 自动没完成（极验在软件浏览器里常反复挑战）→ 交用户手动登录（有界重试 + 成功回检）
+        lp = self._live_page(page) or page
+        for attempt in range(1, 4):
+            self.engine.wait_manual(
+                "gsxt 需要登录才能搜索。\n"
+                "账号密码程序已自动填好：请在浏览器里手动完成验证并点【登录】按钮，"
+                "登录成功（跳回公示系统首页）后点【继续】。\n"
+                "若仍停在登录页，说明验证还没过，请再点一次【登录】或刷新重试。"
+                "（你已确认手动输入可以登录）")
+            lp = self._live_page(page) or lp
+            if self._login_succeeded(lp) or self._gsxt_is_logged_in(lp):
+                self.engine.log("  ✔ 检测到已登录（手动）")
+                self._gsxt_logged_in = True
+                return self._after_login_enter(lp)
+            self.engine.log("  ⚠ 仍未检测到登录成功，请再试一次（第 %d 次）" % attempt)
+        # 兜底：当作用户已登录继续往下走（搜索可能仍可用，或留在当前页截图）
+        self.engine.log("  ⚠ 多次手动登录仍未确认成功，继续尝试搜索（若被拦请换 IP 或手动登录）")
         self._gsxt_logged_in = True
-        return self._after_login_enter(page)
+        return self._after_login_enter(self._live_page(page) or page)
 
     def enter_detail(self, page, company: str) -> bool:
         """gsxt：先登录（配了账号时）→ 搜索企业 → 人工过极验并点选企业 → 切到详情新标签页。
@@ -499,21 +629,31 @@ class GsxtHandler(PlatformHandler):
             if self._detect_ip_blocked(page):
                 self.engine.log("  ⚠ 仍然被限制，跳过自动查询（按当前画面截图）")
                 return False
-        # 配了账号就先登录再搜：匿名搜索会被 WAF/IP 风控拦截，
-        # 官方拒绝页也写明「实名注册/登录后再进行访问」；用户自己的浏览器正是登录态才正常。
-        # 配了账号却仍走匿名，正是多版「点了查询没反应 / 当前IP请求异常」的根因。
-        if not getattr(self, "_gsxt_logged_in", False):
-            cred = (self.engine.credentials or {}).get("gsxt") or {}
-            if cred.get("username") and cred.get("password"):
-                page = self._try_login_first(page)
-        self._search_company(page, company)
-        # 点查询后才发现被风控（点了没反应）→ 同样走实名登录/换 IP 的补救，再搜一次
-        if getattr(self, "_gsxt_ip_blocked", False):
+
+        creds = (self.engine.credentials or {}).get("gsxt") or {}
+        has_creds = bool(creds.get("username") and creds.get("password"))
+
+        # ① 先**匿名慢速搜索**（登录是整条链路最不稳的一环，能不登录就不登录）。
+        #    用户反馈「手动能登、软件死循环」正是因为之前一上来就强制登录。
+        self.engine.log("  → 先尝试匿名搜索（慢速输入，避免被风控判机器人）：%s" % company)
+        status = self._search_company(page, company)
+        self.engine.log("  匿名搜索结果状态：%s" % status)
+
+        # ② 匿名没通过 + 配了账号 + 还没登录 → 才走登录通道，登录后重搜一次。
+        #    （匿名 'reacted' 说明已经能搜 / 弹验证码，无需登录；'blocked' 走清票据补救）
+        if status in ("login", "none") and has_creds and not getattr(self, "_gsxt_logged_in", False):
+            self.engine.log("  匿名搜索未通过，改走登录通道（慢速输入账号密码）后重搜")
+            page = self._try_login_first(page)
+            page = getattr(self, "_gsxt_page", None) or page
+            status = self._search_company(page, company)
+            self.engine.log("  登录后搜索结果状态：%s" % status)
+        elif status == "blocked":
+            # 清掉判废票据再搜一次（不强制登录）
             page = self._resolve_ip_block(page)
             if self._detect_ip_blocked(page):
                 self.engine.log("  ⚠ 当前 IP 仍被限制，跳过自动查询（按当前画面截图）")
                 return False
-            self._search_company(page, company)
+            status = self._search_company(page, company)
             if getattr(self, "_gsxt_ip_blocked", False):
                 self.engine.log("  ⚠ IP 仍被公示系统限制，停止自动查询")
                 return False
@@ -586,25 +726,27 @@ class GsxtHandler(PlatformHandler):
         self.engine.log("  ⚠ 未能进入企业详情页，按当前页面截图")
         return False
 
-    def _search_company(self, page, company: str) -> None:
-        """在 gsxt 首页搜索框填企业名称并点【查询】（不登录）。
+    def _search_company(self, page, company: str) -> str:
+        """在 gsxt 首页**慢速**输入公司名并点【查询】。返回状态字符串：
 
-        站点有特殊限制：经常出现「点了查询没跳转」——
-        瑞数链路没就绪、输入值没被站点脚本读到时都表现为毫无反应。
-        所以这里每一步都验证，不靠猜：
-          1) 填词后**回读输入框**，确认值真的写进去了；
-          2) 点查询后 6 秒内确认「有反应」——跳到 corp-query-search 结果页，
-             或极验/图形验证弹层出现；
-          3) 没反应依次回落：Playwright 真实鼠标点击 → 输入框回车
-             → 重走入口链再来一轮（最多 3 轮）。
+          'reacted' —— 已跳到结果页（corp-query-search）或已弹极验
+                       （进入 wait_manual 让用户过码 / 点企业即可）
+          'login'   —— 点查询后被跳转到登录页（匿名搜索被拦，需要登录）
+          'blocked' —— 命中 IP 风控 / 拒绝页（400 / 当前IP请求异常）
+          'none'    —— 点了毫无反应（没明确拒绝页、也没跳转）
+
+        关键修复（用户反馈「点了查询没反应 / 登录死循环」）：
+          · 公司名用**逐字符慢速输入**（type_human），瞬时灌值会被瑞数/极验
+            行为式风控判机器人 → 表现为点了没反应；
+          · 返回状态而非布尔，让 enter_detail 决定「先匿名搜、登录作兜底」，
+            不再一上来就强制登录（登录是整条链路最不稳的一环）。
         """
-        reacted = False
         for attempt in range(1, 3):
             # 查询前先看是不是已经被风控（此时点按钮不会跳转，重试只会更糟）
             if self._detect_ip_blocked(page):
                 self._gsxt_ip_blocked = True
                 self._log_ip_blocked()
-                return
+                return "blocked"
             if attempt > 1:
                 self.engine.log("  ↻ 搜索没有反应，重走入口链再试（第 %d 轮）" % attempt)
                 lp = self._live_page(page) or page
@@ -613,8 +755,8 @@ class GsxtHandler(PlatformHandler):
                 if self._detect_ip_blocked(page):
                     self._gsxt_ip_blocked = True
                     self._log_ip_blocked()
-                    return
-            self.engine.log("在 gsxt 首页搜索：%s" % company)
+                    return "blocked"
+            self.engine.log("在 gsxt 首页搜索（慢速输入）：%s" % company)
             # 确认现在确实停在 gsxt 首页（而不是卡在 Bing/搜索结果页——
             # 那样点查询当然没反应，必须先回到入口链）
             try:
@@ -630,7 +772,7 @@ class GsxtHandler(PlatformHandler):
             except Exception:
                 pass
 
-            # ---- 填词 + 回读校验（防止「看着填上了其实没写进去」）----
+            # ---- 填词 + 回读校验（慢速逐字输入，防止「看着填上了其实没写进去」）----
             filled = False
             for fill_attempt in range(1, 4):
                 if self._fill_keyword(page, company):
@@ -651,24 +793,26 @@ class GsxtHandler(PlatformHandler):
                 self.engine.log("  ⚠ 搜索框定位/填入失败，进入下一轮重试")
                 continue
             self.engine.sleep(0.8)
-            self.engine.log("  填词结果：%s；准备点击【查询】" % ("OK" if filled else "失败"))
+            self.engine.log("  填词结果：OK；准备点击【查询】")
 
             # ---- 点查询 + 验证有反应 ----
             self._click_query(page)
             # 极验弹层常驻独立 iframe，渲染比主页面慢，给足 8s
             if self._wait_search_reaction(page, timeout=8):
-                reacted = True
                 self.engine.log("  ✔ 点查询后有反应（已跳转或已弹验证）")
-                break
-            else:
-                self.engine.log("  ⚠ 点查询后 8s 内既没跳转、也没弹出验证层")
-
-            # 点完毫无反应时先确认是不是被风控——是就不再做任何
-            # 「真实点击 / 回车 / 重走入口链」，那些动作会加重 IP 风控。
+                return "reacted"
+            # 点完没反应：先确认是不是被风控
             if self._detect_ip_blocked(page):
                 self._gsxt_ip_blocked = True
                 self._log_ip_blocked()
-                return
+                return "blocked"
+            # 被跳到登录页？
+            try:
+                if self._find_login_page(list(page.context.pages)) is not None:
+                    self.engine.log("  ⚠ 点查询后被跳转到登录页（匿名搜索被拦，需要登录）")
+                    return "login"
+            except Exception:
+                pass
 
             # ---- 回落：输入框回车 / 站内结果页链接 ----
             self.engine.log("  ⚠ 点【查询】后没有跳转，改用输入框回车再试")
@@ -677,27 +821,23 @@ class GsxtHandler(PlatformHandler):
             except Exception:
                 pass
             if self._wait_search_reaction(page, timeout=8):
-                reacted = True
-                break
+                return "reacted"
             if self._detect_ip_blocked(page):
                 self._gsxt_ip_blocked = True
                 self._log_ip_blocked()
-                return
+                return "blocked"
             # 再兜一层：页面里如果本来就有指向结果页的链接，点它最稳
             # （链接自带站点追加的参数，点击产生的导航还带 Referer）
             if self._click_search_link(page):
                 if self._wait_search_reaction(page, timeout=8):
-                    reacted = True
-                    break
+                    return "reacted"
                 if self._detect_ip_blocked(page):
                     self._gsxt_ip_blocked = True
                     self._log_ip_blocked()
-                    return
+                    return "blocked"
 
-        if not reacted:
-            self.engine.log("  ⚠ 自动搜索始终没有跳转（已重试 2 轮）。"
-                            "请在浏览器里手动点【查询】完成搜索；"
-                            "若页面提示 IP 异常，请换 IP 或到 shiming.gsxt.gov.cn 实名登录。")
+        self.engine.log("  ⚠ 自动搜索始终没有跳转（已重试 2 轮）")
+        return "none"
 
     def _click_search_link(self, page) -> bool:
         """兜底：点页面里指向结果页（corp-query-search）的链接。
@@ -719,8 +859,17 @@ class GsxtHandler(PlatformHandler):
         return str(r).startswith("CLICK")
 
     def _fill_keyword(self, page, company: str) -> bool:
-        """把企业名称填进搜索框（原生 setter + input/change 事件）。"""
+        """把企业名称填进搜索框。
+
+        用**逐字符真实键盘输入**（type_human，拟人随机间隔）——公司名瞬间灌入会被
+        瑞数/极验行为式风控当成机器人，表现为「点了查询没反应 / 被拦」。与登录填值
+        同理，慢速手敲才不会被识别。填完回读校验，失败回落原生 setter。
+        """
         try:
+            val = type_human(page, "() => document.getElementById('keyword')", company)
+            if val and val.strip() == company.strip():
+                return True
+            self.engine.log("  逐字符输入回读不一致（%r），回落原生填值" % (val or "")[:20])
             if fill_controlled(page, "() => document.getElementById('keyword')", company):
                 return True
             return bool(set_native(page, "() => document.getElementById('keyword')", company))
