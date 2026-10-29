@@ -122,7 +122,7 @@ class WenshuHandler(PlatformHandler):
         return r if isinstance(r, str) else ""
 
     def open_advanced_search(self, page) -> bool:
-        """从首页进入「高级检索」表单。
+        """从首页进入「高级检索」表单（失败自动重试，最多 3 轮）。
 
         首页的「高级检索 ▾」是背景图，必须按类名取坐标后用真实鼠标点击。
 
@@ -130,6 +130,10 @@ class WenshuHandler(PlatformHandler):
         这个跳转会把 page.goto 打断并抛异常（Navigation ... interrupted by
         another navigation）。所以这里用 core.nav.goto 统一处理，
         跳到哪算哪，不当成失败。
+
+        用户日志里出现过「高级检索表单未展开」一次失败就整个采集项挂掉：
+        首页资源慢时入口元素还没渲染出来 —— 所以加多轮重试，
+        每轮失败后重新等首页再点。
         """
         self.engine.log("  打开裁判文书网首页…")
         try:
@@ -138,29 +142,32 @@ class WenshuHandler(PlatformHandler):
         except Exception as exc:
             self.engine.log("  ✘ 首页打开失败：%s" % str(exc).splitlines()[0][:90])
             return False
-        self.engine.sleep(5.0)
-        box = page.evaluate("""(cls)=>{
-            const d=document.querySelector(cls);
-            if(!d) return null;
-            const b=d.getBoundingClientRect();
-            if(b.width<10||b.height<10) return null;
-            return {x:b.x+b.width/2, y:b.y+b.height/2};
-        }""", WS_ADV_CLS)
-        if not box:
-            self.engine.log("  ✘ 首页未找到「高级检索」入口")
-            return False
-        page.mouse.click(box["x"], box["y"])
-        self.engine.sleep(2.5)
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            vis = page.evaluate("""()=>{
-                const i=document.querySelector('#s17');
-                return !!(i && i.getClientRects().length);}""")
-            if vis:
-                self.engine.log("  ✔ 已进入高级检索表单")
-                return True
-            self.engine.sleep(0.6)
-        self.engine.log("  ✘ 高级检索表单未展开")
+        for rnd in range(1, 4):
+            self.engine.sleep(5.0 if rnd == 1 else 4.0)
+            box = page.evaluate("""(cls)=>{
+                const d=document.querySelector(cls);
+                if(!d) return null;
+                const b=d.getBoundingClientRect();
+                if(b.width<10||b.height<10) return null;
+                return {x:b.x+b.width/2, y:b.y+b.height/2};
+            }""", WS_ADV_CLS)
+            if not box:
+                self.engine.log("  ⚠ 首页未找到「高级检索」入口（第 %d 次），稍后重试" % rnd)
+                self.engine.sleep(3.0)
+                continue
+            page.mouse.click(box["x"], box["y"])
+            self.engine.sleep(2.5)
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                vis = page.evaluate("""()=>{
+                    const i=document.querySelector('#s17');
+                    return !!(i && i.getClientRects().length);}""")
+                if vis:
+                    self.engine.log("  ✔ 已进入高级检索表单")
+                    return True
+                self.engine.sleep(0.6)
+            self.engine.log("  ⚠ 高级检索表单未展开（第 %d 次），重新点入口" % rnd)
+        self.engine.log("  ✘ 高级检索表单未能展开（已重试 3 次）")
         return False
 
     def search(self, page, fields: dict, ids: dict = None) -> dict:
@@ -295,7 +302,7 @@ class WenshuHandler(PlatformHandler):
     def collect_group(self, page, company: str, gsteps: list,
                       results: List[StepResult], shots: List[str]) -> None:
         """裁判文书网一组采集项（诉讼/仲裁 或 行贿）的执行入口。"""
-        subj = getattr(self, "_current_subject", None)
+        subj = self.subject
         person = bool(subj and subj.mode == MODE_PERSON)
         tag = subj.label() if subj else company
 
@@ -333,7 +340,7 @@ class WenshuHandler(PlatformHandler):
     def collect_person_group(self, page, company: str, gsteps: list,
                           results: List[StepResult], shots: List[str], tag: str) -> None:
         """人员模式：一次「当事人=姓名 + 全文=身份证号」检索，随后逐个案件类型细化。"""
-        subj = getattr(self, "_current_subject", None)
+        subj = self.subject
         name = (subj.person if subj else "").strip()
         idcard = (subj.idcard if subj else "").strip()
         if not name:
@@ -382,7 +389,7 @@ class WenshuHandler(PlatformHandler):
         单位：当事人 = 单位完整名称，全文 = 案件类型；结果里有曾用名则分别再查一次。
         行贿：全文 = 单位 / 人员 -> 搜索出结果 -> 全文再搜索「行贿」。
         """
-        subj = getattr(self, "_current_subject", None)
+        subj = self.subject
         case = step.get("case", "")
         flow = step.get("ws_flow", "party")
         paths = []

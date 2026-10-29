@@ -109,7 +109,10 @@ class TestCaptcha(unittest.TestCase):
         self.assertEqual(out, "8k3d")
         self.assertIn("/createTask", sent["url"])
         self.assertEqual(sent["body"]["clientKey"], "KEY")
-        self.assertEqual(sent["body"]["task"]["type"], "ImageToTextTaskOcrBase")
+        # 2026-10 起 solve_image_to_text 优先用**异步题型 ImageToTextTask**
+        # （官方标注识别率更高；实测信用中国描边验证码，同步题型会把
+        #   描边阴影读成多余字符，异步题型读得更准），失败才回落 OcrBase。
+        self.assertEqual(sent["body"]["task"]["type"], "ImageToTextTask")
         self.assertIn("body", sent["body"]["task"])
 
     def test_async_task_polls(self):

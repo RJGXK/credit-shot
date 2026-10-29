@@ -90,8 +90,8 @@ def main():
 
         solver = CaptchaSolver("", "cn", print)  # 无 key，只测取图
         t0 = time.time()
-        raw, how = solver._capture_captcha(p2, "#vcodeimg",
-                                           p2.query_selector(".vcodepop"))
+        raw, how, meta = solver._capture_captcha(p2, "#vcodeimg",
+                                                 p2.query_selector(".vcodepop"))
         dt = time.time() - t0
         check("验证码取图成功", bool(raw) and len(raw) > 500,
               "来源=%s 大小=%d 耗时=%.2fs" % (how, len(raw or b""), dt))

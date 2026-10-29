@@ -1,7 +1,7 @@
 ﻿; 企业信用一键截图工具 —— NSIS 安装包脚本
 ;
 ; 用法：
-;   makensis /DAPP_VERSION=2.0.0 installer.nsi
+;   makensis /DAPP_VERSION=2.1.1 installer.nsi
 ;
 ; 产物：dist\企业信用截图工具_安装包.exe
 ;
@@ -20,9 +20,9 @@
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 
-; 版本号可以由命令行覆盖：makensis /DAPP_VERSION=2.0.0 installer.nsi
+; 版本号可以由命令行覆盖：makensis /DAPP_VERSION=2.1.1 installer.nsi
 !ifndef APP_VERSION
-  !define APP_VERSION "2.0.0"
+  !define APP_VERSION "2.1.1"
 !endif
 
 ; 安装目录：优先用程序文件，权限不足时退回用户目录

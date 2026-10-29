@@ -68,7 +68,7 @@ class ShixinHandler(PlatformHandler):
         self.wait_ready(page, "()=>!!document.getElementById('myform')", timeout=30)
         self.engine.sleep(1.5)
 
-        subj = getattr(self, "_current_subject", None)
+        subj = self.subject
         if subj and subj.has_person:
             q_name = subj.person.strip()
             q_id = subj.idcard.strip() or subj.code.strip()

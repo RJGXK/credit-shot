@@ -14,6 +14,7 @@
     POST /api/captcha/test         测试打码服务
     POST /api/selfcheck            功能自检
     POST /api/open-output          用系统文件管理器打开输出目录
+    POST /api/open-logs            用系统文件管理器打开日志文件夹
     POST /api/validate-output      校验输出目录是否可用
 """
 from __future__ import annotations
@@ -33,6 +34,7 @@ from auth.credentials import (Credential, credentials_to_map,
 from config import (BROWSER_CHANNELS, DEFAULTS, INFO_BAR_MODES, MODE_FORMAT,
                     MODE_HINT, MODE_OF_LABEL, SITES, step_supports)
 from core.control import Control
+from core.filelog import get_file_logger, log_dir
 from core.result import StepResult
 from engine import Engine
 from web.events import (EVENT_DONE, EVENT_LOG, EVENT_RESULT, EVENT_STATUS,
@@ -66,6 +68,9 @@ class TaskManager:
         self.last_error = ""
         self._lock = threading.Lock()
         self._watcher: Optional[threading.Thread] = None
+        # 运行日志落盘：界面日志只存在于内存里，窗口一关就没了（用户反馈），
+        # 这里把每一行同时追加写进 %APPDATA%\企业信用截图工具\logs\。
+        self.flog = get_file_logger()
 
     # ------------------------------------------------------------ 状态
     def set_state(self, state: str, detail: str = "") -> None:
@@ -153,7 +158,8 @@ class TaskManager:
             self.engine = None
 
     def _log(self, message: str) -> None:
-        """引擎线程的日志出口：转成事件推给前端。"""
+        """引擎线程的日志出口：推给前端 + 追加写入本地日志文件。"""
+        self.flog.write(message)
         self.bus.publish(EVENT_LOG, message)
 
     def _start_watcher(self) -> None:
@@ -238,6 +244,8 @@ def get_catalog() -> Dict[str, Any]:
                 "title": st["title"],
                 "short": st.get("short", st["title"]),
                 "subject": st.get("subject", "company"),
+                # 人员模式下置灰（如军网「全部」「政府采购失信名单」）
+                "person_subject": st.get("person_subject", True),
             })
         sites.append({
             "key": site["key"],
@@ -448,3 +456,19 @@ def open_output(payload: Dict[str, str]) -> Dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=400, detail="打开失败：%s" % exc)
     return {"ok": True, "path": os.path.abspath(path)}
+
+
+@router.post("/api/open-logs")
+def open_logs() -> Dict[str, Any]:
+    """用系统文件管理器打开日志文件夹（运行日志落盘在这里）。
+
+    日志按天分文件：``运行日志_YYYYMMDD.log``，保留 30 天。
+    """
+    d = log_dir()
+    if not os.path.isdir(d):
+        raise HTTPException(status_code=400, detail="日志目录不存在：%s" % d)
+    try:
+        os.startfile(d)   # noqa: S606  (Windows 专用)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="打开失败：%s" % exc)
+    return {"ok": True, "path": d}

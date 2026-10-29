@@ -456,13 +456,33 @@ def _login_wenshu(page, username: str, password: str, log: LogFn,
 
 # ------------------------------------------------------------------ 国家企业信用信息公示系统
 def _gsxt_has_geetest(page) -> bool:
-    """页面上有没有极验验证（geetest）面板。"""
+    """页面上有没有**正在显示**的极验验证（geetest）面板。
+
+    实测坑：gsxt 页面模板里常留三个隐藏的 geetest 容器
+    （geetest_challenge / geetest_validate / geetest_seccode，display:none、宽高 0）。
+    只按「宽>100 高>60」判断，在这些残留 DOM 上会误判成「还在等验证」，
+    于是走进死循环（用户日志：「⚠ 登录后没有等到明确结果」）。
+    所以这里额外要求它**真的可见**。
+    """
     try:
         return bool(page.evaluate("""()=>{
           const els=[...document.querySelectorAll('[class*=geetest],[id*=geetest]')];
           return els.some(e=>{
+            let st=null;
+            try{ st=getComputedStyle(e); }catch(err){ return false; }
+            if(st.display==='none'||st.visibility==='hidden') return false;
             const b=e.getBoundingClientRect();
             return b.width>100 && b.height>60;});}"""))
+    except Exception:
+        return False
+
+
+def _gsxt_login_form_present(page) -> bool:
+    """登录框（#UserName / #gsxtp）还在不在。还在就一定没登录成功。"""
+    try:
+        return bool(page.evaluate(
+            "()=>!!(document.getElementById('UserName')"
+            "||document.getElementById('gsxtp'))"))
     except Exception:
         return False
 
@@ -518,16 +538,20 @@ def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
                     pass
         time.sleep(1.5)
     # 兜底：直接打开登录子站页
-    try:
-        page.goto("https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html",
-                  wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
-        if page.evaluate("()=>!!document.getElementById('UserName')"):
-            log("  ✔ 已直达 gsxt 登录页")
-            return True
-    except Exception:
-        pass
-    return False
+    # 注意：真机实测登录页是 **socialuser-use-login.html**
+    #（老代码里写的 socialuser-use-rllogin.html 是另一个地址），
+    # 而且直连 shiming.gsxt.gov.cn 会被瑞数 WAF 拦成「Environment Checking」白页，
+    # 所以两个地址都试一遍，只认真正渲染出 #UserName 的那次。
+    for url in ("https://shiming.gsxt.gov.cn/socialuser-use-login.html",
+                "https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html"):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+            if page.evaluate("()=>!!document.getElementById('UserName')"):
+                log("  ✔ 已直达 gsxt 登录页")
+                return True
+        except Exception:
+            pass
     return False
 
 
@@ -584,8 +608,39 @@ def _gsxt_submit(page) -> bool:
 
 
 def _gsxt_judge(page, log: LogFn):
-    """判定 gsxt 登录结果，返回 (状态, 说明)；状态 ∈ ok / captcha / badcred / unknown。"""
+    """判定 gsxt 登录结果，返回 (状态, 说明)；状态 ∈ ok / captcha / badcred / unknown。
+
+    判定顺序（从可靠到不可靠）：
+      1. **URL 离开 shiming.gsxt.gov.cn** —— 登录成功后站点会**整页跳回**
+         www.gsxt.gov.cn/index.html，登录页上根本没有任何成功标志，
+         光看页面文字必然判不出来（用户日志：「⚠ 登录后没有等到明确结果」）。
+      2. 页面出现明确的成功文字（退出登录 / 已登录 …）。
+      3. 登录框还在 -> 一定没成功；再看是不是弹了验证。
+    """
+    # 1) URL 判定（最可靠）
+    try:
+        cur = page.url or ""
+    except Exception:
+        cur = ""
+    if cur and "shiming.gsxt.gov.cn" not in cur and "gsxt.gov.cn" in cur:
+        return "ok", "登录成功（已跳回公示系统首页）"
+
     text = _page_text(page)
+
+    # 2) 明确的成功标志（这些词只可能出现在登录成功之后的页面）
+    if text and re.search(r"退出登录|已登录|登录成功|注销", text):
+        return "ok", "页面已显示登录用户信息"
+
+    # 3) 登录框还在 -> 一定没登录成功
+    if _gsxt_login_form_present(page):
+        if _gsxt_has_geetest(page):
+            return "captcha", "需要人工完成滑块/点选验证"
+        if text and re.search(
+                r"密码错误|账号不存在|帐号不存在|用户名或密码|不正确|登录失败|手机号未注册",
+                text):
+            return "badcred", "账号或密码不正确"
+        return "unknown", "登录框仍在（未提交成功）"
+
     if not text:
         return "unknown", "登录后未读到页面内容"
     if re.search(r"退出|注销|个人中心|欢迎您|已登录|退出登录", text):
@@ -595,9 +650,122 @@ def _gsxt_judge(page, log: LogFn):
     if re.search(r"密码错误|账号不存在|帐号不存在|用户名或密码|不正确|登录失败|手机号未注册",
                  text):
         return "badcred", "账号或密码不正确"
-    if re.search(r"请输入密码|请输入手机号", text):
-        return "unknown", "登录框仍在（未提交成功）"
     return "unknown", "登录后未确认结果"
+
+
+def _gsxt_wait_result(page, log: LogFn, seconds: float = 90.0):
+    """等 gsxt 登录结果，返回 (状态, 说明)。
+
+    状态 ∈ ok / badcred / captcha / unknown
+
+    关键设计（都是被用户的死循环日志逼出来的）：
+      · **人工过码之后程序不主动再点登录**。极验通过后站点会自己提交并整页
+        跳回首页；程序再点一次 #btn_login，站点就再弹一次验证 —— 无限循环。
+      · 判定以 **URL** 为准：离开 shiming.gsxt.gov.cn 即登录成功。
+      · 跳回首页途中被瑞数 WAF 拦成**白页**（用户实测：刷新等 5 秒也没用）
+        时，等是等不出来的 —— 会在「白页恢复窗口」里重新经入口链进首页
+        （带 cookie 的会话还在，重新进就等于恢复登录态）。
+      · 只有在「验证面板已经消失、但页面一直没动」超过 grace 秒之后，
+        才补点一次登录（极验可能只做了校验没提交），而且**只补一次**。
+    """
+    deadline = time.time() + seconds
+    observe_from = time.time()
+    grace = 25.0   # 面板消失后等多久才补点登录（站点跳回首页本身可能就要十几秒）
+    resubmitted = False
+    saw_captcha = False
+    blank_since = None          # 白页开始时间；None = 当前不是白页
+    blank_waited = False        # 白页已给过恢复窗口、也重进过一次
+    while time.time() < deadline:
+        time.sleep(1.5)
+
+        # 1) URL 判定
+        try:
+            cur_url = page.url or ""
+        except Exception:
+            cur_url = ""
+        if cur_url and "shiming.gsxt.gov.cn" not in cur_url:
+            # 白页也是「离开了登录子站」—— 先确认页面真的能用才算成功
+            blank = _gsxt_page_is_blank(page)
+            if not blank:
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                time.sleep(1.5)
+                return "ok", "登录成功：已从登录页跳回公示系统首页"
+            if blank_since is None:
+                blank_since = time.time()
+                log("  ↻ 跳回首页途中被拦成白页，等站点自行恢复…")
+            elif (not blank_waited and time.time() - blank_since >= 8.0):
+                # 给了 8 秒恢复窗口还是白页：**必须走上级目录入口链**重进。
+                # 直接 goto gsxt.gov.cn/index.html 会命中瑞数 521 挑战页
+                # （项目已验证过：gsxt 不能直连，要从 www.samr.gov.cn 点进去），
+                # 之前恢复失败就是因为这里用了直连。
+                blank_waited = True
+                log("  ↻ 白页未恢复，经市场监管总局入口链重新进入公示系统…")
+                try:
+                    from core.nav import goto_via_landing
+                    r = goto_via_landing(page, "gsxt", log=log)
+                    if isinstance(r, dict) and r.get("page") is not None:
+                        page = r["page"]
+                except Exception as exc:
+                    log("  ⚠ 入口链进入失败：%s" % str(exc).splitlines()[0][:80])
+            elif blank_waited and time.time() - blank_since >= 30.0:
+                # 重新进过还是白页：登录态大概率没保住，交给上层重走入口链
+                log("  ⚠ 白页持续存在，稍后由采集流程重新经上级目录进入")
+                return "unknown", "跳回首页时被拦成白页"
+            continue
+
+        blank_since = None
+
+        # 2) 页面文字判定
+        state, msg = _gsxt_judge(page, log)
+        if state == "ok":
+            return "ok", msg
+        if state == "badcred":
+            return "badcred", msg
+
+        # 3) 兜底：首页搜索框出现 = 重定向完成
+        try:
+            if page.evaluate("()=>!!document.getElementById('keyword')"):
+                return "ok", "登录重定向完成，首页已就绪"
+        except Exception:
+            pass
+
+        # 4) 验证面板还在 -> 继续等
+        if _gsxt_has_geetest(page):
+            saw_captcha = True
+            continue
+
+        # 5) 面板没了但页面没动：补点一次登录（只补一次）
+        if (not resubmitted) and (time.time() - observe_from) >= grace:
+            resubmitted = True
+            observe_from = time.time()
+            log("  → 验证面板已消失但页面未跳转，补点一次登录…")
+            _gsxt_submit(page)
+
+    if saw_captcha:
+        return "captcha", "验证面板还在，未确认登录结果"
+    return "unknown", "等待登录结果超时"
+
+
+def _gsxt_page_is_blank(page) -> bool:
+    """页面是不是白页（瑞数 WAF 拦截后只剩空壳）。
+
+    判据：body 文本 < 20 字符且没有搜索框。误判代价低 ——
+    只影响「等多久再重进」，不会把成功的登录误判掉。
+    """
+    try:
+        st = page.evaluate("""()=>{
+          const b=document.body;
+          const len=b?(b.innerText||'').trim().length:0;
+          const hasKw=!!document.getElementById('keyword');
+          return {len, hasKw};
+        }""")
+        return bool(st and not st.get("hasKw") and st.get("len", 0) < 20)
+    except Exception:
+        # evaluate 都失败（上下文没起来）多半也是白页/跳转中
+        return True
 
 
 def _login_gsxt(page, username: str, password: str, log: LogFn,
@@ -629,7 +797,9 @@ def _login_gsxt(page, username: str, password: str, log: LogFn,
         return LoginResult(reason="没找到登录按钮", filled=True)
     log("  → 已提交登录…")
 
+    # ---- 阶段一：提交后 25 秒内等结果 ----
     deadline = time.time() + 25
+    need_captcha = False
     while time.time() < deadline:
         time.sleep(1.5)
         state, msg = _gsxt_judge(page, log)
@@ -640,87 +810,65 @@ def _login_gsxt(page, username: str, password: str, log: LogFn,
             log("  ⚠ 提示账号或密码不正确")
             return LoginResult(reason=msg, filled=True, bad_credentials=True)
         if state == "captcha":
-            # 先试打码服务（站点若同时有图形验证码）
-            if solve_captcha is not None:
-                try:
-                    done = bool(solve_captcha(page))
-                except Exception as exc:
-                    done = False
-                    log("  ⚠ 打码服务处理验证码时出错：%s" % exc)
-                if done:
-                    log("  ✔ 验证码已由打码服务自动完成")
-                    d3 = time.time() + 20
-                    while time.time() < d3:
-                        time.sleep(1.2)
-                        s3, m3 = _gsxt_judge(page, log)
-                        if s3 == "ok":
-                            return LoginResult(ok=True, reason=m3, filled=True)
-                        if s3 == "badcred":
-                            return LoginResult(reason=m3, filled=True,
-                                               bad_credentials=True)
-                        if s3 == "captcha":
-                            break
-            if wait_captcha is None:
-                log("  ⚠ gsxt 登录需要人工完成验证")
-                return LoginResult(reason=msg, filled=True, needs_captcha=True)
-            log("  ⏸ 账号密码已填好，请在浏览器里完成验证")
-            wait_captcha(
-                "国家企业信用信息公示系统登录需要人工完成验证：账号密码已由程序自动填好，"
-                "请在浏览器窗口里完成滑块 / 点选 / 图形码验证，"
-                "完成后点【我已处理，继续截图】。")
-            if not _gsxt_has_geetest(page):
-                _gsxt_submit(page)
-                log("  → 已再次提交登录…")
-            d2 = time.time() + 60
-            jumped_home = False
-            while time.time() < d2:
-                time.sleep(1.5)
-                # 瑞数 WAF 遇到白页或环境检测页，等待其放行
-                try:
-                    title = page.title() or ""
-                    if "Environment Checking" in title or "环境检测" in title or "请稍候" in title:
-                        continue
-                except Exception:
-                    pass
+            need_captcha = True
+            break
+    if not need_captcha and _gsxt_has_geetest(page):
+        need_captcha = True
+    if not need_captcha:
+        log("  ⚠ 登录后没有等到明确结果")
+        return LoginResult(reason="登录后未确认结果", filled=True)
 
-                # ★ 先查「是否已跳回首页」再查极验：
-                # gsxt 登录成功后**整页跳回** www.gsxt.gov.cn/index.html（实测），
-                # 登录页句柄上什么成功标志都没有；极验弹层 DOM 还可能残留，
-                # 先走 _gsxt_judge 会一直误判 captcha 死循环。
-                try:
-                    cur_url = page.url or ""
-                    if "shiming.gsxt.gov.cn" not in cur_url:
-                        # 已离开登录子站：回到首页 = 登录成功
-                        try:
-                            page.wait_for_load_state("domcontentloaded", timeout=15000)
-                        except Exception:
-                            pass
-                        time.sleep(2.0)
-                        log("  ✔ 登录成功：已从登录页跳回首页")
-                        return LoginResult(ok=True, reason="登录后跳回首页",
-                                           filled=True)
-                except Exception:
-                    pass
+    # ---- 阶段二：验证码（极验只能人工）----
+    # 先试打码服务（站点若同时有图形验证码）
+    if solve_captcha is not None:
+        try:
+            done = bool(solve_captcha(page))
+        except Exception as exc:
+            done = False
+            log("  ⚠ 打码服务处理验证码时出错：%s" % exc)
+        if done:
+            log("  ✔ 验证码已由打码服务自动完成")
+            st, mm = _gsxt_wait_result(page, log, seconds=25)
+            if st == "ok":
+                return LoginResult(ok=True, reason=mm, filled=True)
+            if st == "badcred":
+                return LoginResult(reason=mm, filled=True, bad_credentials=True)
 
-                s2, m2 = _gsxt_judge(page, log)
-                if s2 == "ok":
-                    log("  ✔ 人工补完验证后登录成功（%s）" % m2)
-                    return LoginResult(ok=True, reason=m2, filled=True)
-                if s2 == "badcred":
-                    return LoginResult(reason=m2, filled=True, bad_credentials=True)
-                if s2 == "captcha":
-                    # 滑块可能还在，等待一会儿
-                    time.sleep(1.0)
-                    continue
+    if wait_captcha is None:
+        log("  ⚠ gsxt 登录需要人工完成验证")
+        return LoginResult(reason="需要人工完成验证", filled=True,
+                           needs_captcha=True)
 
-                # 兜底：页面上下文里能读到首页搜索框也算登录成功
-                try:
-                    has_kw = page.evaluate("()=>!!document.getElementById('keyword')")
-                    if has_kw:
-                        log("  ✔ 登录重定向完成，首页已就绪")
-                        return LoginResult(ok=True, reason="登录重定向完成", filled=True)
-                except Exception:
-                    pass
+    prompt = ("国家企业信用信息公示系统登录需要人工完成验证：账号密码已由程序自动填好，"
+              "请在浏览器窗口里完成滑块 / 点选 / 图形码验证，"
+              "完成后点【我已处理，继续截图】。")
+    log("  ⏸ 账号密码已填好，请在浏览器里完成验证")
+    wait_captcha(prompt)
+
+    # ★ 人工过码之后**程序不再自动点登录**：
+    #   极验通过后站点会自己提交并整页跳回首页；
+    #   程序再点一次 #btn_login，站点就会**再弹一次验证** —— 于是无限循环
+    #   （用户日志：「→ 已再次提交登录… → ⚠ 登录后没有等到明确结果」）。
+    #   这里改成「只观察」，由 _gsxt_wait_result 按 URL / 页面状态判定。
+    log("  → 等待站点自动提交并跳回首页…")
+    state2, msg2 = _gsxt_wait_result(page, log, seconds=90)
+    if state2 == "ok":
+        log("  ✔ 人工补完验证后登录成功（%s）" % msg2)
+        return LoginResult(ok=True, reason=msg2, filled=True)
+    if state2 == "badcred":
+        return LoginResult(reason=msg2, filled=True, bad_credentials=True)
+    if state2 == "captcha":
+        # 验证面板还在 —— 多半是用户没真正过码，再给一次机会
+        log("  ⏸ 验证面板还在，请再完成一次验证")
+        wait_captcha(prompt)
+        state3, msg3 = _gsxt_wait_result(page, log, seconds=60)
+        if state3 == "ok":
+            log("  ✔ 人工补完验证后登录成功（%s）" % msg3)
+            return LoginResult(ok=True, reason=msg3, filled=True)
+        if state3 == "badcred":
+            return LoginResult(reason=msg3, filled=True, bad_credentials=True)
+        return LoginResult(reason="验证码后仍未确认登录结果", filled=True,
+                           needs_captcha=True)
 
     log("  ⚠ 登录后没有等到明确结果")
     return LoginResult(reason="登录后未确认结果", filled=True)

@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>企业信用一键截图工具</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='4' y='4' width='24' height='24' rx='7' fill='none' stroke='%232563eb' stroke-width='3'/></svg>">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<!-- ===================== 品牌条 ===================== -->
+<header class="brand">
+  <div class="brand-mark"></div>
+  <div class="brand-text">
+    <h1>企业信用一键截图工具</h1>
+    <p>7 个站点 · 28 类信用记录 · 单位 / 人员双模式</p>
+  </div>
+  <div class="brand-right">
+    <span id="statusChip" class="chip chip-idle">就绪</span>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ===================== 左栏 ===================== -->
+  <section class="col-left">
+
+    <!-- 查询主体 -->
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">查询主体</span>
+        <span class="card-side" id="subjectFormatHint">企业名称|统一社会信用代码</span>
+      </div>
+      <div class="card-body">
+        <div class="segmented" id="modeSegment">
+          <button class="seg active" data-mode="单位">单位</button>
+          <button class="seg" data-mode="人员">人员</button>
+        </div>
+        <p class="hint" id="modeHint">一行一个，可批量；信用代码可留空，只写企业名称也行</p>
+        <textarea id="subjectInput" spellcheck="false"
+                  placeholder="每行一个主体&#10;例如：华为技术有限公司"></textarea>
+      </div>
+    </div>
+
+    <!-- 输出设置 -->
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">输出设置</span>
+        <span class="card-side">
+          <button class="link-btn" id="btnCredentials">账号密码</button>
+          <span class="muted" id="credSummary">未配置</span>
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="field-row">
+          <label>保存目录</label>
+          <input type="text" id="outputDir" spellcheck="false">
+          <button class="btn btn-ghost" id="btnBrowse">浏览</button>
+        </div>
+        <div class="field-row two">
+          <label>浏览器</label>
+          <select id="browserSel"></select>
+          <label>截图方式</label>
+          <select id="shotModeSel"></select>
+        </div>
+        <div class="field-row">
+          <label>节流间隔</label>
+          <input type="number" id="paceInput" min="0" max="600" step="5">
+          <span class="note">秒 · 每个主体、每一步之间等一次，模拟正常使用频率</span>
+        </div>
+        <div class="field-row">
+          <label></label>
+          <label class="check"><input type="checkbox" id="pdfCheck"><span>额外生成 PDF 汇总</span></label>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 右栏 ===================== -->
+  <section class="col-right">
+
+    <!-- 需要截取的内容 -->
+    <div class="card card-grow">
+      <div class="card-head">
+        <span class="card-title">需要截取的内容</span>
+        <span class="card-side">
+          <span id="countText" class="muted">已选 0 / 0</span>
+          <button class="link-btn" id="btnAll">全选</button>
+          <button class="link-btn" id="btnNone">全不选</button>
+        </span>
+      </div>
+      <div class="site-jump" id="siteJump" title="点击跳到对应站点"></div>
+      <div class="card-body scroll" id="checklist"></div>
+    </div>
+
+    <!-- 运行日志 -->
+    <div class="card card-log">
+      <div class="card-head">
+        <span class="card-title">运行日志</span>
+        <span class="card-side muted" id="logHint">实时推送 · 已自动保存到本地</span>
+      </div>
+      <div class="card-body scroll log" id="logBox"></div>
+    </div>
+  </section>
+</main>
+
+<!-- ===================== 底部工具栏 ===================== -->
+<footer class="toolbar">
+  <div class="toolbar-left">
+    <button class="btn btn-primary" id="btnStart">开始截图</button>
+    <button class="btn" id="btnResume" disabled>我已处理，继续截图</button>
+    <button class="btn" id="btnSkip" disabled>跳过此步</button>
+    <button class="btn" id="btnStop" disabled>中止</button>
+  </div>
+  <div class="toolbar-right">
+    <button class="btn btn-ghost" id="btnSelfcheck">功能自检</button>
+    <button class="btn btn-ghost" id="btnOpenLogs">打开日志文件夹</button>
+    <button class="btn btn-ghost" id="btnOpenBrowser">用浏览器打开</button>
+    <button class="btn btn-ghost" id="btnOpenDir">打开输出目录</button>
+  </div>
+</footer>
+
+<footer class="statusbar">
+  <span id="statusText" class="muted">查询类型：单位</span>
+  <span class="muted" id="footNote">截图方式：原图+日期弹窗+信息条 · 浏览器：Edge · 日期弹窗 = 叠加系统右下角日期/时间面板</span>
+</footer>
+
+<!-- ===================== 账号密码弹窗 ===================== -->
+<dialog id="credDialog" class="dialog">
+  <form method="dialog" class="dialog-inner">
+    <h2>账号密码 <span class="muted">勾选启用并填写账号密码，引擎遇到登录页会自动登录</span></h2>
+
+    <div class="dialog-scroll">
+      <h3 class="section-title">平台账号</h3>
+      <div class="cred-table">
+        <div class="cred-head">
+          <span class="c-chk">启用</span>
+          <span class="c-name">平台</span>
+          <span class="c-user">账号</span>
+          <span class="c-pass">密码</span>
+          <span class="c-eye"></span>
+        </div>
+        <div id="credRows"></div>
+      </div>
+      <p class="hint" id="credHint"></p>
+
+      <h3 class="section-title">验证码服务</h3>
+      <div class="field-row">
+        <label>API Key</label>
+        <input type="text" id="captchaKey" spellcheck="false">
+        <span class="muted">YesCaptcha（留空 = 验证码全部手动输入）</span>
+      </div>
+      <p class="hint">官方题型里没有极验滑块和天艾点选，这两类验证码仍需人工完成；
+        图形码、reCAPTCHA v2、hCaptcha、Turnstile 可以自动过。</p>
+    </div>
+
+    <div class="dialog-bar">
+      <button type="button" class="btn btn-primary" id="btnCredSave">保存到本地</button>
+      <button type="button" class="btn btn-ghost" id="btnCredLoad">从本地载入</button>
+      <button type="button" class="btn btn-ghost" id="btnCredTest">测试打码服务</button>
+      <span class="muted" id="credStatus"></span>
+      <button type="button" class="btn btn-ghost" id="btnCredClose">关闭</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

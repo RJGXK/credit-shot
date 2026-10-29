@@ -54,7 +54,8 @@ def main() -> int:
     check("GET /api/catalog 返回 200", r.status_code == 200)
     check("站点数 = 8", len(catalog["sites"]) == 8, str(len(catalog["sites"])))
     check("采集项数 = 30", total == 30, str(total))
-    check("含 8 个登录平台", len(catalog["login_platforms"]) == 8)
+    check("登录平台 = 2 个（仅裁判文书网 + 公示系统）",
+          len(catalog["login_platforms"]) == 2)
     check("含 4 种截图方式", len(catalog["shot_modes"]) >= 4)
     check("含认监委平台",
           any(s["key"] == "cnca" for s in catalog["sites"]))

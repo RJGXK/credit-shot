@@ -16,6 +16,7 @@ const state = {
   credPlatforms: [],
   credRows: new Map(), // platform -> {enabled, username, password, show}
   captchaKeySet: false, // 本地是否已保存打码服务 API Key
+  subjectDrafts: {},    // 按模式分开保存的查询主体草稿（单位/人员互不覆盖）
 };
 
 const SHOT_MODES = ['原图', '原图+信息条', '原图+日期弹窗', '原图+日期弹窗+信息条'];
@@ -79,15 +80,21 @@ function renderChecklist() {
     // 三态全选：点一下「全勾」（除非已全勾 → 全不勾）。
     // 不能直接依赖 all.checked —— 子项单独勾选时全选框状态不会跟着变，
     // 飘掉的状态会让「全不勾后点全选」失效（实测踩坑）。
-    all.addEventListener('click', (e) => {
-      e.preventDefault();               // 阻止原生切换，状态完全由代码控制
+    //
+    // ★ 必须用 change 事件，**不能**用 click + preventDefault：
+    //   HTML5 checkbox 有「取消激活行为」（canceled activation behavior）：
+    //   一旦在 click 里调了 preventDefault()，浏览器会在事件结束后把
+    //   checked 状态**回滚**成点击前的值 —— 代码里设的 all.checked 会被冲掉，
+    //   表现就是「点了全选，子项都变了，组头却不显示对勾」（用户反馈）。
+    //   改用 change：浏览器先完成自己的切换（不会被回滚），
+    //   我们再按切换后的状态同步子项，最后 refreshCounts 收回三态。
+    all.addEventListener('change', () => {
       const rows = [...block.querySelectorAll('.step-row input')]
         .filter((cb) => !cb.disabled);
-      const anyUnchecked = rows.some((cb) => !cb.checked);
-      const target = anyUnchecked;      // 有没勾的 → 全勾；已全勾 → 全不勾
+      // 组头此刻的状态就是用户想要的最终状态：
+      //   未全勾（含半选）→ 全勾；已全勾 → 全不勾。
+      const target = all.checked;
       rows.forEach((cb) => { cb.checked = target; });
-      all.checked = target;
-      all.indeterminate = false;
       refreshCounts();
     });
     const name = document.createElement('span');
@@ -109,6 +116,7 @@ function renderChecklist() {
       cb.value = step.key;
       cb.checked = true;
       cb.dataset.subject = step.subject;
+      cb.dataset.personSubject = step.person_subject === false ? 'false' : 'true';
       cb.addEventListener('change', refreshCounts);
 
       // 阻止原生 label 带来的第二次点击（label 触发两次 click，导致勾选状态反转）
@@ -181,7 +189,10 @@ function applyMode() {
   const modeKey = state.mode === '单位' ? 'company' : 'person';
   document.querySelectorAll('#checklist .step-row input').forEach((cb) => {
     const subject = cb.dataset.subject;
-    const ok = subject === 'either' || subject === modeKey;
+    // person_subject=false：两种模式都可选，但人员模式下置灰
+    // （用户要求：军网「全部」「政府采购失信名单」不做人员查询）
+    const personDisabled = modeKey === 'person' && cb.dataset.personSubject === 'false';
+    const ok = !personDisabled && (subject === 'either' || subject === modeKey);
     cb.disabled = !ok;
     if (!ok) { cb.checked = false; }
     cb.closest('.step-row').classList.toggle('disabled', !ok);
@@ -491,13 +502,21 @@ async function testCaptcha() {
 
 /* ------------------------------------------------------------------ 绑定 */
 function bindEvents() {
+  // 单位 / 人员的查询主体**分开保存**：切换模式时各自恢复上次输入。
+  // 用户反馈「输入人员信息会同步修改单位信息」—— 之前两个模式共用一个
+  // textarea，切到人员改了几行，切回单位发现全变了。
   $('modeSegment').addEventListener('click', (evt) => {
     const btn = evt.target.closest('.seg');
     if (!btn) return;
+    if (btn.dataset.mode === state.mode) return;   // 点在当前模式上，忽略
+    // 先把当前模式已输入的内容存起来
+    state.subjectDrafts[state.mode] = $('subjectInput').value;
     state.mode = btn.dataset.mode;
     document.querySelectorAll('#modeSegment .seg').forEach((b) => {
       b.classList.toggle('active', b === btn);
     });
+    // 恢复该模式下上次输入的内容（没有就给空）
+    $('subjectInput').value = state.subjectDrafts[state.mode] || '';
     $('subjectFormatHint').textContent = state.mode === '单位'
       ? '企业名称|统一社会信用代码' : '人员姓名|身份证号';
     $('modeHint').textContent = state.mode === '单位'
@@ -552,6 +571,16 @@ function bindEvents() {
       await api('/api/open-output', {
         method: 'POST', body: JSON.stringify({ path: $('outputDir').value.trim() })
       });
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  });
+
+  // 打开日志文件夹：运行日志已按天落盘（%APPDATA%\企业信用截图工具\logs），
+  // 界面日志窗口关了也不丢，出问题可以拿日志文件回查
+  $('btnOpenLogs').addEventListener('click', async () => {
+    try {
+      await api('/api/open-logs', { method: 'POST' });
     } catch (err) {
       toast(err.message, 'error');
     }

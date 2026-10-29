@@ -113,7 +113,7 @@ class PlapHandler(PlatformHandler):
             return ""
         self.engine.sleep(3.5)
 
-        subj = getattr(self, "_current_subject", None)
+        subj = self.subject
         use_person = bool(subj and subj.has_person)
 
         if use_person:

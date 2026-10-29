@@ -140,7 +140,7 @@ SITES = [
         "platform_url": "https://www.plap.mil.cn/freecms-glht/site/juncai/jdjc/index.html",
         "steps": [
             {"no": "16", "mark": "⑯", "key": "mil_quanbu", "kind": "plap", "group": "plap",
-             "subject": "either",
+             "subject": "either", "person_subject": False,
              "title": "军队采购网 - 全部", "short": "军队采购网全部", "tab": "全部"},
             {"no": "17", "mark": "⑰", "key": "mil_yujing", "kind": "plap", "group": "plap",
              "subject": "either",
@@ -152,7 +152,7 @@ SITES = [
              "subject": "either",
              "title": "军队采购网 - 军队采购失信名单", "short": "军队采购网失信名单", "tab": "军队采购失信名单"},
             {"no": "20", "mark": "⑳", "key": "mil_zhengfucaigou", "kind": "plap", "group": "plap",
-             "subject": "either",
+             "subject": "either", "person_subject": False,
              "title": "军队采购网 - 政府采购失信名单", "short": "军队采购网政府采购失信", "tab": "政府采购失信名单"},
         ],
     },
@@ -267,9 +267,14 @@ def step_supports(step: dict, mode: str) -> bool:
 
     subject 字段：
       "company" 只支持单位；"person" 只支持人员；"either" 两种都支持。
+    另有 person_subject: False —— 两种模式都放着，但**人员模式下置灰**
+    （用户要求：军网的「全部」「政府采购失信名单」不做人员查询，
+    这两个 tab 的表单没有「处理主体类型=专家」的个人查询入口）。
     """
     s = step.get("subject", MODE_COMPANY)
     if s == "either":
+        if mode == MODE_PERSON and step.get("person_subject") is False:
+            return False
         return True
     return s == mode
 
@@ -313,6 +318,10 @@ SHOT_MODES = ["原图", "原图+信息条", "原图+日期弹窗", "原图+日�
 # 「auto」= 该平台已实现自动登录流程（引擎检测到登录页时会自动填账号密码登录）；
 #        其它平台 auto=False：公开查询通常免登录，若真的被拦下仍会挂起等人工处理，
 #        填了账号密码也会在日志里提示「该平台暂不支持自动登录，请手动登录」。
+#
+# 用户要求（2026-10-29）：只有**裁判文书网**和**公示系统（gsxt）**保留账号密码配置；
+# 信用中国 / 政府采购网 / 住建部 / 军队采购网 / 失信被执行人网 / 认证认可平台
+# 全部免登录 —— 不在「账号密码」卡片里出现，界面上少一堆无用输入框。
 LOGIN_PLATFORMS = [
     {
         "key": "wenshu",
@@ -336,60 +345,6 @@ LOGIN_PLATFORMS = [
                 "这类官方打码题型不支持，需人工完成。"
                 "站点直连会被判定异常 IP，程序已改为从「国家市场监督管理总局」"
                 "跳转进入。",
-    },
-    {
-        "key": "creditchina",
-        "name": "信用中国",
-        "host": "www.creditchina.gov.cn",
-        "url": "https://www.creditchina.gov.cn/",
-        "account": "手机号 / 用户名",
-        "auto": False,
-        "hint": "信息公开查询免登录；专项查询偶尔要求登录。",
-    },
-    {
-        "key": "ccgp",
-        "name": "中国政府采购网",
-        "host": "www.ccgp.gov.cn",
-        "url": "https://www.ccgp.gov.cn/",
-        "account": "用户名",
-        "auto": False,
-        "hint": "严重违法失信名单查询免登录。",
-    },
-    {
-        "key": "mohurd",
-        "name": "住建部（建筑市场监管）",
-        "host": "jzsc.mohurd.gov.cn",
-        "url": "https://jzsc.mohurd.gov.cn/home",
-        "account": "用户名",
-        "auto": False,
-        "hint": "企业查询免登录；详情页需通过滑块验证。",
-    },
-    {
-        "key": "plap",
-        "name": "军队采购网",
-        "host": "www.plap.mil.cn",
-        "url": "https://www.plap.mil.cn/",
-        "account": "用户名",
-        "auto": False,
-        "hint": "五个失信名单查询免登录。",
-    },
-    {
-        "key": "zxgk",
-        "name": "最高法失信被执行人网",
-        "host": "zxgk.court.gov.cn",
-        "url": "https://zxgk.court.gov.cn/shixin/",
-        "account": "用户名",
-        "auto": False,
-        "hint": "查询免登录；有天艾点选验证码，需人工完成。",
-    },
-    {
-        "key": "cnca",
-        "name": "全国认证认可信息公共服务平台",
-        "host": "cx.cnca.cn",
-        "url": "https://cx.cnca.cn/CertECloud/index/index/page",
-        "account": "用户名",
-        "auto": False,
-        "hint": "体系与证书查询免登录；检索与查看详情包含极验点选验证码，需人工完成。",
     },
 ]
 

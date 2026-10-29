@@ -163,11 +163,29 @@ class YesCaptcha:
 
     # ------------------------------------------------------------ 题型
     def solve_image_to_text(self, image_bytes: bytes) -> str:
-        """识别图形验证码（图片里的英数字），返回文本。同步题型，一次请求出结果。"""
+        """识别图形验证码（图片里的英数字），返回文本。
+
+        先用**异步题型 ImageToTextTask**（官方标注「识别率更高」），实测也确实更准：
+
+        信用中国的验证码是 95x25 的小图，字符带**描边阴影**，
+        同步题型（ImageToTextTaskOcrBase）会把描边当成第二个字符 ——
+        真值 "C6A1" 被读成 "C6A11"，提交必然被判错；
+        异步题型同一张图读成 "C6A1"（真值）/ "Q9H0"（真值），明显更准。
+
+        异步题型报错或返回空时，再回落到同步题型（便宜一半）。
+        """
         body = base64.b64encode(image_bytes).decode("ascii")
-        task = {"type": "ImageToTextTaskOcrBase", "body": body}
-        text = self._solve(task, "text")
-        return (text or "").strip()
+        try:
+            text = self._solve({"type": "ImageToTextTask", "body": body,
+                                "numeric": 4, "case": 0}, "text")
+            text = (text or "").strip()
+            if text:
+                return text
+        except CaptchaError as exc:
+            self._last_node_error = "异步题型失败：%s" % exc
+        body = base64.b64encode(image_bytes).decode("ascii")
+        return (self._solve({"type": "ImageToTextTaskOcrBase", "body": body},
+                             "text") or "").strip()
 
     def solve_image_to_text_async(self, image_bytes: bytes, numeric: int = 4,
                                   case_sensitive: bool = False) -> str:

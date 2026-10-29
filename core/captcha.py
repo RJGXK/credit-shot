@@ -23,13 +23,31 @@ YesCaptcha 协议客户端在 core/yescaptcha.py。
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import time
 
 from core.yescaptcha import YesCaptcha
 
 __all__ = ["CaptchaSolver", "image_looks_blank", "denoise_captcha",
-           "preprocess_captcha", "image_not_loaded"]
+           "preprocess_captcha", "image_not_loaded", "image_fingerprint"]
+
+
+def image_fingerprint(data: bytes) -> str:
+    """验证码图片指纹（MD5 前 10 位）。
+
+    用来判断「刚截到的这张图，是不是刚才那张」。
+    用户反馈「信用中国验证码总是输入识别到的上一个验证码」——
+    根因就是换图后浏览器还在显示**上一帧旧图**，
+    程序把旧图送去识别 → 提交的一定是上一个验证码。
+    有了指纹就能在提交前挡住这种「假换图」。
+    """
+    if not data:
+        return ""
+    try:
+        return hashlib.md5(data).hexdigest()[:10]
+    except Exception:
+        return ""
 
 
 def image_looks_blank(data: bytes) -> bool:
@@ -317,33 +335,189 @@ class CaptchaSolver:
             self.log("  ⚠ 直接取验证码图片失败：%s" % str(exc).splitlines()[0][:70])
         return b""
 
-    def _capture_captcha(self, page, img_selector: str, scope):
+    # ------------------------------------------------------- 验证码图片状态
+    def _img_state(self, page, img_selector: str, scope_selector: str = "") -> dict:
+        """读页面上验证码 <img> 的实时状态。
+
+        返回 {"src": 图片地址, "ok": 是否真的解码成功,
+              "vis": 是否可见, "index": 第几个匹配元素, "known": 状态是否可信}
+
+        两个关键判据（都是踩过坑才定下来的）：
+
+        1. **naturalWidth > 0** 才算「图真的出来了」。
+           offsetWidth 只是 CSS 盒模型尺寸 —— Edge 的 ORB（Opaque Response
+           Blocking）把跨源验证码拦成 net::ERR_BLOCKED_BY_ORB 时，页面上是个
+           **破图**：naturalWidth=0，但 offsetWidth 仍然是几十像素。
+           用 offsetWidth 当就绪判据，就会把**破图图标**截下来送去识别，
+           识别出来必然是乱码（用户日志里「识别为 Z82MZ82」就是这种）。
+        2. 页面上可能存在**多个**同 id 的 <img>（站点模板里留着一份隐藏副本），
+           document.querySelector 会挑到隐藏那份 —— 截出来永远是旧的图，
+           表现就是「总是输入识别到的上一个验证码」。
+           所以这里扫全部匹配项，挑「可见 + 已解码」的那一个。
+        """
+        unknown = {"src": "", "ok": True, "vis": True, "index": -1, "known": False}
+        js = """
+        (arg)=>{
+          const root = arg.scope ? document.querySelector(arg.scope) : document;
+          if(!root) return {src:'', ok:false, vis:false, index:-1};
+          const els=[...root.querySelectorAll(arg.sel)];
+          let best=null, bestScore=-1;
+          for(let i=0;i<els.length;i++){
+            const e=els[i];
+            let b=null, st=null;
+            try{ b=e.getBoundingClientRect(); st=getComputedStyle(e); }catch(err){ continue; }
+            const vis = st.display!=='none' && st.visibility!=='hidden'
+                        && b.width>0 && b.height>0;
+            const loaded = !!(e.complete && (e.naturalWidth||0)>0);
+            const score = (vis?4:0) + (loaded?2:0) + Math.min(b.width*b.height,1e5)/1e5;
+            if(score>bestScore){
+              bestScore=score;
+              best={src:(e.currentSrc||e.src||''), ok:loaded, vis:vis, index:i};
+            }
+          }
+          return best || {src:'', ok:false, vis:false, index:-1};
+        }"""
+        try:
+            r = page.evaluate(js, {"sel": img_selector, "scope": scope_selector})
+        except Exception:
+            return dict(unknown)
+        if isinstance(r, dict):
+            r.setdefault("known", True)
+            return r
+        return dict(unknown)
+
+    def _pick_img_handle(self, page, img_selector: str, scope, state: dict):
+        """挑出要截图的那个 <img> 元素句柄（优先挑页面上真正在显示的那份）。"""
+        els = []
+        try:
+            els = list((scope.query_selector_all(img_selector) if scope
+                        else page.query_selector_all(img_selector)) or [])
+        except Exception:
+            els = []
+        idx = int(state.get("index", -1) or -1)
+        handle = None
+        if els and 0 <= idx < len(els):
+            handle = els[idx]
+        elif els:
+            handle = els[0]
+        if handle is None:
+            try:
+                handle = (scope.query_selector(img_selector) if scope
+                          else page.query_selector(img_selector))
+            except Exception:
+                handle = None
+        return handle
+
+    def _fetch_static_image(self, page, handle, img_selector: str) -> bytes:
+        """静态地址的验证码图可以直接用接口取字节（跨源破图时的兜底）。
+
+        **动态验证码接口绝不能这样取** —— 二次 GET 会让服务端刷新 session 里的
+        验证码，页面上的图立刻作废（v1.0.1 的历史教训）。
+        """
+        src = ""
+        try:
+            if handle is not None:
+                src = handle.get_attribute("src") or ""
+        except Exception:
+            src = ""
+        if not src.startswith("http"):
+            return b""
+        if any(k in src for k in ("verify", "captcha", "code", "random")):
+            return b""
+        raw = self.fetch_image_bytes(page, src)
+        if raw:
+            self.log("  ↻ 页面上的静态验证码图已改用接口直接取图")
+        return raw
+
+    def _refresh_captcha(self, page, scope, scope_selector: str,
+                         img_selector: str, old_src: str = "") -> bool:
+        """换一张验证码图，并等到**真的换掉了**再返回。
+
+        坑（用户反馈「总是输入识别到的上一个验证码」）：
+        点完「换一张」之后，浏览器里往往还显示着**上一帧旧图**，
+        这时候截图送去识别，识别到的就是上一个验证码 —— 必然被站点判错。
+        所以点完之后要等图片地址变化（站点换图一般会带新的随机参数）。
+        """
+        target = scope or page
+        ok = _click_refresh(target, self.log, scope_selector, self.nap)
+        if not ok:
+            ok = _reload_image(target, img_selector, self.nap)
+        if not ok:
+            self.nap(1.5)
+            return False
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            st = self._img_state(page, img_selector, scope_selector)
+            src = st.get("src") or ""
+            if src and old_src and src != old_src:
+                return True           # 地址变了 —— 换图成功
+            if st.get("ok") and not old_src:
+                return True
+            self.nap(0.3)
+        return True
+
+    def _wait_new_image(self, page, scope_selector: str, img_selector: str,
+                        old_src: str = "", timeout: float = 4.0) -> bool:
+        """等站点自己把验证码图换掉（判错后站点会自动换图）。
+
+        实测（信用中国 js/vcode/vcode.js）：
+            报错分支里会调用 updateVocdeFun()，
+            它既换图（src 带新随机数）又清空输入框。
+        所以程序判错后**不必**再点「换一张」——
+        再点一次等于多发一次请求，容易把站点的限流/风控打出来
+        （表现出来就是验证码图变破图）。
+
+        返回 True 表示图已经换了。
+        """
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            st = self._img_state(page, img_selector, scope_selector)
+            src = st.get("src") or ""
+            if src and src != old_src:
+                return True
+            self.nap(0.3)
+        return False
+
+    def _capture_captcha(self, page, img_selector: str, scope,
+                         scope_selector: str = ""):
         """拿到当前验证码图片的字节。
 
-        多层稳固截取策略：
-        1. 确保图片已在浏览器中完成渲染（complete && naturalWidth > 0）；
-        2. 针对带 CSS transform / fixed 的弹层，临时消除平移干扰，
-           使 element.screenshot 0.1 秒内瞬间完成，杜绝 scroll-into-view 超时；
-        3. 若 element.screenshot 异常，无缝降级到视口绝对坐标切片（page.screenshot clip）；
-        4. 严禁对动态生成的验证码接口盲目发起 page.request.get(src)，避免服务端刷新 session
-           导致页面中的验证码作废。
-        """
-        # 1. 等待图片真实加载就绪（最多等 4 秒）
-        deadline = time.time() + 4.0
-        while time.time() < deadline:
-            ready = False
-            try:
-                ready = page.evaluate("""(sel)=>{
-                  const el = document.querySelector(sel);
-                  return !!(el && el.complete && (el.naturalWidth > 0 || el.offsetWidth > 0));
-                }""", img_selector)
-            except Exception:
-                pass
-            if ready:
-                break
-            self.nap(0.2)
+        返回 (bytes|None, 来源说明, meta)
+          meta = {"src": 取图时的图片地址, "ok": 图片是否真的解码成功}
 
-        # 2. 临时消除弹窗父级 transform 动画与滚动干扰
+        实战修正（用户反馈「信用中国总是输入识别到的上一个验证码」）：
+          1. 就绪判据只用 **naturalWidth > 0**，破图不截（详见 _img_state）；
+          2. 挑「可见且已解码」的那张 <img>，不挑模板里的隐藏副本；
+          3. 记录取图时的 src —— 识别完再比对一次，
+             站点在识别期间换了图的话，这次结果已经作废，**绝不能提交**。
+        """
+        state = self._img_state(page, img_selector, scope_selector)
+        meta = {"src": state.get("src") or "", "ok": bool(state.get("ok"))}
+        known = bool(state.get("known", True))
+
+        # 1. 等待图片真的解码出来（最多 2.5 秒）
+        #    注意：破图（ORB 拦截）时等再久也没用 —— src 不变就不会有新请求，
+        #    快速失败让外层循环去「换一张」（新 src = 新请求 = 新机会）。
+        if known and not meta["ok"]:
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
+                self.nap(0.2)
+                state = self._img_state(page, img_selector, scope_selector)
+                meta = {"src": state.get("src") or "", "ok": bool(state.get("ok"))}
+                if meta["ok"] or not state.get("known", True):
+                    break
+
+        handle = self._pick_img_handle(page, img_selector, scope, state)
+
+        # 2. 图没解码出来（破图 / 还在加载）：截元素只会截到破图图标
+        if known and not meta["ok"]:
+            self.log("  ⚠ 验证码图片没有真正加载出来（破图或仍在加载）")
+            raw = self._fetch_static_image(page, handle, img_selector)
+            if raw:
+                return raw, "接口取图", meta
+            return None, "", meta
+
+        # 3. 临时消除弹窗父级 transform 动画与滚动干扰
         js_normalize = """(sel)=>{
           const img = document.querySelector(sel);
           if(!img) return null;
@@ -391,11 +565,9 @@ class CaptchaSolver:
 
         raw = None
         try:
-            img = (scope.query_selector(img_selector) if scope
-                   else page.query_selector(img_selector))
-            if img:
+            if handle is not None:
                 try:
-                    raw = img.screenshot(timeout=3000)
+                    raw = handle.screenshot(timeout=3000)
                 except Exception:
                     pass
             # 降级到 page clip 截图
@@ -411,20 +583,14 @@ class CaptchaSolver:
                 pass
 
         if raw:
-            return raw, "页面图片"
+            return raw, "页面图片", meta
 
-        # 仅在非动态验证码（或确实没有任何方式截到图）时，才尝试兜底（记录提示）
-        try:
-            src = img.get_attribute("src") or "" if img else ""
-        except Exception:
-            src = ""
-        if src.startswith("http") and not any(k in src for k in ("verify", "captcha", "code", "random")):
-            raw = self.fetch_image_bytes(page, src)
-            if raw:
-                self.log("  ↻ 页面上的静态验证码图已改用接口直接取图")
-                return raw, "接口取图"
+        # 仅在非动态验证码（或确实没有任何方式截到图）时，才尝试兜底
+        raw = self._fetch_static_image(page, handle, img_selector)
+        if raw:
+            return raw, "接口取图", meta
 
-        return None, ""
+        return None, "", meta
 
     def _fill_captcha_input(self, page, scope_selector: str, text: str) -> bool:
         """把识别结果填进验证码输入框。
@@ -531,10 +697,13 @@ class CaptchaSolver:
 
         完整闭环（每一轮）：
           1. 取图（页面已加载的 <img>，取不到就用接口直接取字节）；
-          2. 去干扰线 + 放大 -> 送打码服务识别；
-          3. 填进验证码输入框；
-          4. 点「验证」按钮（精确选择器优先，只点最内层元素）；
-          5. 判定结果：站点提示「验证码错误」就**只换验证码图**再试下一轮。
+          2. **指纹去重**：和前面见过的是同一张图就不提交 ——
+             那说明站点没真换图，提交上去必然是「上一个验证码」；
+          3. 识别；
+          4. **换图守卫**：识别期间站点若换了图，本次识别结果作废，不提交；
+          5. 填进验证码输入框；
+          6. 点「验证」按钮（精确选择器优先，只点最内层元素）；
+          7. 判定结果：站点提示「验证码错误」就**只换验证码图**再试下一轮。
 
         刷新只换图（点站点的「看不清? 换一张」/ 改 img.src 加时间戳），
         **绝不刷新整个页面** —— 刷新整页会把已经填好的主体名称冲掉。
@@ -554,23 +723,35 @@ class CaptchaSolver:
             scope = None
 
         rounds = max(1, int(tries))
+        seen = set()      # 已经见过 / 提交过的图片指纹（同一张图不重复提交）
         for attempt in range(1, rounds + 1):
             # ---------- 1) 取图 ----------
-            raw, how = self._capture_captcha(page, img_selector, scope)
+            raw, how, meta = self._capture_captcha(page, img_selector, scope,
+                                                    scope_selector)
             if not raw:
                 self.log("  ⚠ 拿不到验证码图片（第 %d 轮），刷新换图重试" % attempt)
                 if attempt < rounds:
-                    if not (_click_refresh(scope or page, self.log, scope_selector, self.nap)
-                            or _reload_image(scope or page, img_selector, self.nap)):
-                        self.nap(1.5)
+                    self._refresh_captcha(page, scope, scope_selector,
+                                          img_selector, meta.get("src"))
                     continue
                 return False
+
+            fp = image_fingerprint(raw)
+            if fp and fp in seen:
+                # 还是同一张图 —— 站点其实没换图（浏览器还显示着上一帧）。
+                # 这时候提交上去就是「识别到的上一个验证码」，必然被判错。
+                self.log("  ↻ 验证码图片没有变化（还是上一张），换图重试（第 %d 轮）" % attempt)
+                if attempt < rounds:
+                    self._refresh_captcha(page, scope, scope_selector,
+                                          img_selector, meta.get("src"))
+                    continue
+                return False
+
             if image_looks_blank(raw):
                 self.log("  ↻ 验证码图片是空白（第 %d 轮），刷新换图重试" % attempt)
                 if attempt < rounds:
-                    if not (_click_refresh(scope or page, self.log, scope_selector, self.nap)
-                            or _reload_image(scope or page, img_selector, self.nap)):
-                        self.nap(1.5)
+                    self._refresh_captcha(page, scope, scope_selector,
+                                          img_selector, meta.get("src"))
                     continue
                 self.log("  ⚠ 验证码始终未显示出内容，自动识别无法进行")
                 return False
@@ -578,7 +759,11 @@ class CaptchaSolver:
             # ---------- 2) 识别 ----------
             text = ""
             try:
-                data = preprocess_captcha(raw)
+                # ★ 直接送**原图**，不要 LANCZOS 放大：
+                #   浏览器已经把原图按 CSS 拉伸过一次，再插值放大只会把
+                #   描边阴影糊成一团 —— 实测信用中国那种图
+                #   （原图 95x25、字符带描边）放大后识别率明显变差。
+                data = raw
                 fn_text = getattr(solver, "solve_image_to_text", None)
                 if fn_text is not None:
                     text = fn_text(data)
@@ -590,20 +775,40 @@ class CaptchaSolver:
             if not text:
                 self.log("  ↻ 识别结果为空（第 %d 轮），刷新验证码重试" % attempt)
                 if attempt < rounds:
-                    if not (_click_refresh(scope or page, self.log, scope_selector, self.nap)
-                            or _reload_image(scope or page, img_selector, self.nap)):
-                        self.nap(1.5)
+                    self._refresh_captcha(page, scope, scope_selector,
+                                          img_selector, meta.get("src"))
                     continue
                 self.log("  ⚠ 打码服务没有返回有效结果")
                 return False
+
+            # ---------- 3) 换图守卫 ----------
+            # 识别要花几秒，这期间站点可能自己换了图 —— 那样这次结果已经作废。
+            # 先比对图片指纹确认「真的换了」才作废，避免误伤（有的站点只是重渲染）。
+            st = self._img_state(page, img_selector, scope_selector)
+            if st.get("src") and meta.get("src") and st["src"] != meta["src"]:
+                raw2 = b""
+                try:
+                    raw2, _, _ = self._capture_captcha(page, img_selector, scope,
+                                                       scope_selector)
+                except Exception:
+                    raw2 = b""
+                if raw2 and image_fingerprint(raw2) != fp:
+                    self.log("  ↻ 识别期间验证码已被站点更换，本次识别结果作废")
+                    seen.add(fp)
+                    if attempt < rounds:
+                        self._refresh_captcha(page, scope, scope_selector,
+                                              img_selector, st.get("src"))
+                        continue
+                    return False
+
             self.log("  ✔ 验证码自动识别完成（识别为 %s，来源：%s）" % (text, how or "图片"))
 
-            # ---------- 3) 填入 ----------
+            # ---------- 4) 填入 ----------
             if not self._fill_captcha_input(page, scope_selector, text):
                 self.log("  ⚠ 验证码输入框没找到")
                 return False
 
-            # ---------- 4) 提交 ----------
+            # ---------- 5) 提交 ----------
             # 填入后无需多余延迟，立即原子点击提交，抢在图片被网站自动更换前提交
             if confirm_selectors:
                 hit = False
@@ -624,9 +829,10 @@ class CaptchaSolver:
             if not hit:
                 self.log("  ⚠ 验证码「验证」按钮没找到")
                 return False
+            seen.add(fp)
             self.log("  → 验证码已自动提交")
 
-            # ---------- 5) 判定 ----------
+            # ---------- 6) 判定 ----------
             self.nap(1.5)
             if success_check is not None:
                 try:
@@ -647,10 +853,14 @@ class CaptchaSolver:
                     return True
                 self.log("  ✘ 站点提示「%s」，刷新验证码后重试" % err)
             if attempt < rounds:
-                # 只换验证码图，不刷新整个页面
-                if not (_click_refresh(scope or page, self.log, scope_selector, self.nap)
-                        or _reload_image(scope or page, img_selector, self.nap)):
-                    self.nap(1.5)
+                # ★ 判错后**先等站点自己换图**，别急着点「换一张」：
+                #   站点在报错时已经调用了 updateVocdeFun()（实测 src 会变），
+                #   再点一次等于多发一次请求 —— 信用中国那个接口本来就容易被
+                #   限流/ORB 拦掉，多打一次请求就更容易拿到破图。
+                if not self._wait_new_image(page, scope_selector, img_selector,
+                                            meta.get("src"), timeout=4.0):
+                    self._refresh_captcha(page, scope, scope_selector,
+                                          img_selector, meta.get("src"))
                 self.nap(1.0)
         return False
 
@@ -679,6 +889,24 @@ class CaptchaSolver:
                 has_tianai = False
             if has_tianai:
                 self.log("  ⓘ 登录框是滑块/点选验证码（打码服务不支持），请人工完成")
+                return False
+
+            # 0.5) 极验 geetest：官方打码题型也没有，只能人工
+            #     （gsxt 登录就是这种：登录框里根本没有图形验证码，
+            #       之前会误报「登录框里没找到验证码图片」，让人一头雾水）
+            try:
+                has_geetest = bool(frame.evaluate("""
+                ()=>[...document.querySelectorAll('[class*=geetest],[id*=geetest]')]
+                     .some(e=>{
+                       let st=null;
+                       try{ st=getComputedStyle(e); }catch(err){ return false; }
+                       if(st.display==='none'||st.visibility==='hidden') return false;
+                       const b=e.getBoundingClientRect();
+                       return b.width>100 && b.height>60;})"""))
+            except Exception:
+                has_geetest = False
+            if has_geetest:
+                self.log("  ⓘ 登录框是极验滑块/点选验证（打码服务不支持），请人工完成")
                 return False
 
             # 1) 找验证码图片：先按常见特征找，找不到再按「尺寸像验证码」兜底

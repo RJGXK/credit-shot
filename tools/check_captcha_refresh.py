@@ -71,12 +71,16 @@ class _FakeTarget:
         return None
 
     def evaluate(self, js, arg=None):
+        # 读「验证码错误提示」的脚本必须返回空串（表示没有错误）
+        if "errortip" in js:
+            return ""
+        # 点提交按钮的脚本要返回 "CLICK:xxx"（注意：这段脚本里也有 arg.texts，
+        # 必须排在 "arg.text" 之前判断，否则会被当成填框脚本）
+        if "hit.click()" in js:
+            return "CLICK:验证"
         # 填验证码输入框的脚本要返回 "OK"
         if "arg.text" in js or "arg.scope" in js:
             return "OK"
-        # click_by_text 的脚本要返回 "CLICK:xxx"
-        if "hit.click()" in js:
-            return "CLICK:验证"
         if "getElementById" in js and "captcha" in js:
             return "OK"
         if "querySelectorAll('input" in js:

@@ -117,7 +117,9 @@ class CreditChinaHandler(PlatformHandler):
                 scope_selector=".vcodepop",
                 confirm_selectors=(".vcodepop a.confirm", ".vcodepop .confirm"),
                 success_check=vcode_ok,
-                tries=3,
+                # 信用中国的验证码 95x25、字符带描边阴影，单次识别率不高；
+                # 站点判错后会自己换图，所以多试几轮更划算（实测 3 轮不够）。
+                tries=5,
             )
             if not ok:
                 self.engine.wait_manual("信用中国验证码未能自动识别通过，请在浏览器里输入并点【验证】。")
@@ -164,7 +166,7 @@ class CreditChinaHandler(PlatformHandler):
                          timeout=30)
         self.engine.sleep(1.2)
 
-        person = getattr(self, "_current_subject", None)
+        person = self.subject
         person_name = person.person.strip() if person else ""
         id_tail = person.idcard.strip()[-4:] if person else ""
         if not person_name:
@@ -215,7 +217,7 @@ class CreditChinaHandler(PlatformHandler):
                 scope_selector=".vcodepop",
                 confirm_selectors=(".vcodepop a.confirm", ".vcodepop .confirm"),
                 success_check=vcode_ok_person,
-                tries=3,
+                tries=5,
             )
             if not ok:
                 self.engine.wait_manual("信用中国（自然人名单）验证码未能自动识别通过，请在浏览器里输入并点【验证】。")
