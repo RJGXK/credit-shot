@@ -341,13 +341,28 @@ class CncaHandler(PlatformHandler):
             raise EngineError("没找到【查询】按钮")
         self.engine.log("  已填入企业名称并点【查询】，等待跳转到综合查询页…")
 
-        # 首页是整页跳转，等新地址生效
+        # 首页是整页跳转，等新地址生效。
+        # 没跳成就**再点一次【查询】**——不要直接 goto 结果页地址（用户要求：
+        # 不准直接输网址，必须站点自己的流程点进去，直连会被判审核不通过）。
+        jumped = True
         try:
             page.wait_for_url(re.compile(r"skipResultList"), timeout=30000)
         except Exception:
-            self.engine.log("  ⚠ 没等到页面跳转，直接打开综合查询页")
-            nav.goto(page, RESULT_URL, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log, referer=nav.site_referer("cnca"))
+            jumped = False
+        if not jumped:
+            self.engine.log("  ⚠ 没等到页面跳转，重点一次【查询】")
+            try:
+                page.evaluate("""()=>{
+                  const bs=[...document.querySelectorAll('button,a')];
+                  const b=bs.find(x=>(x.innerText||'').replace(/\\s+/g,'')==='查询');
+                  if(b) b.click();
+                }""")
+            except Exception:
+                pass
+            try:
+                page.wait_for_url(re.compile(r"skipResultList"), timeout=20000)
+            except Exception:
+                self.engine.log("  ⚠ 仍未跳转，按当前页面继续（不直连结果页）")
         self.engine.sleep(2.0)
 
         # ---- 结果页：必须**再填一次**企业名称（服务端没给可见输入框填值）----

@@ -55,10 +55,16 @@ class CcggHandler(PlatformHandler):
         except Exception:
             pass
         if "/cr/list" in cur:
-            self.engine.log("  落到 /cr/list，改用 /search/cr/ 入口")
-            nav.goto(page, HOME_URLS["ccgp_list"],
-                     timeout_ms=self.engine.timeout * 1000, log=self.engine.log,
-                     referer=nav.site_referer("ccgp"))
+            # 落错了页也不能直接输网址（会被判异常）：点页面自己的链接回名单页
+            self.engine.log("  落到 /cr/list，从本级链接点回名单页（不直连）")
+            r = page.evaluate("""()=>{
+              const a=[...document.querySelectorAll('a[href]')]
+                .find(x=>/search\\/cr/.test(x.getAttribute('href')||''));
+              if(!a) return 'NONE';
+              a.click();
+              return 'CLICK:'+(a.getAttribute('href')||'').slice(0,70);
+            }""")
+            self.engine.log("  点名单链接：%s" % str(r)[:90])
             self.engine.sleep(4.0)
 
         self.wait_ready(page, "()=>!!document.querySelector('iframe')", timeout=25)

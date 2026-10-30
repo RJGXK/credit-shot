@@ -105,16 +105,13 @@ ENTRY_CHAINS = {
     # 必须先落到「国家市场监督管理总局」再点「国家企业信用信息公示系统」。
     # 注意 samr 首页上还有 ypzsx/tspjg/xwqy 等 gsxt 子站，
     # 所以必须用 host 精确匹配 www.gsxt.gov.cn。
+    # **不再提供「直接打开 gsxt 首页」的兜底**：用户实测直接输入网址会被判审核不通过，
+    # 必须一步一步点进去；两条总局入口都失败就报错，交给人工处理。
     "gsxt": [
         {"landing": "https://www.samr.gov.cn/", "match": "www.gsxt.gov.cn",
          "expect_host": "www.gsxt.gov.cn"},
         {"landing": "https://www.samr.gov.cn/xw/", "match": "www.gsxt.gov.cn",
          "expect_host": "www.gsxt.gov.cn"},
-        # 兜底也不能裸奔：瑞数会把「无 Referer 直达首页」判成异常请求
-        # （表现：首页能开，但点【查询】毫无反应，刷新后提示 IP 异常）。
-        # 这里显式带上上级目录作为来源。
-        {"landing": "https://www.gsxt.gov.cn/", "match": "",
-         "referer": "https://www.samr.gov.cn/"},
     ],
     # 信用中国：直连返回 412，走政府门户跳转
     "creditchina": [
@@ -134,18 +131,15 @@ ENTRY_CHAINS = {
          "expect_host": "jzsc.mohurd.gov.cn"},
         {"landing": "https://jzsc.mohurd.gov.cn/home", "match": ""},
     ],
-    # 军队采购网
+    # 军队采购网（只从首页点进去；不再直连监督处罚子页 —— 直接输网址会被判异常）
     "plap": [
         {"landing": "https://www.plap.mil.cn/freecms-glht/site/juncai/index.htm",
          "match": "www.plap.mil.cn", "expect_host": "www.plap.mil.cn"},
-        {"landing": "https://www.plap.mil.cn/freecms-glht/site/juncai/jdjc/index.html",
-         "match": ""},
     ],
-    # 最高法失信被执行人网
+    # 最高法失信被执行人网（只从首页点进去；不再直连 /shixin/ 子页）
     "zxgk": [
         {"landing": "https://zxgk.court.gov.cn/shouye/index.html",
          "match": "zxgk.court.gov.cn", "expect_host": "zxgk.court.gov.cn"},
-        {"landing": "https://zxgk.court.gov.cn/shixin/", "match": ""},
     ],
     # 中国裁判文书网：首页即上级目录，站内再点「登录 / 高级检索」
     "wenshu": [

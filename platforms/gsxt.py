@@ -511,15 +511,12 @@ class GsxtHandler(PlatformHandler):
                 self._log_ip_blocked()
                 return
 
-            # ---- 回落：真实鼠标点击 / 回车 / 站内结果页链接 ----
-            self.engine.log("  ⚠ 点【查询】后没有跳转，改用真实鼠标点击再试")
+            # ---- 回落：输入框回车 / 站内结果页链接 ----
+            self.engine.log("  ⚠ 点【查询】后没有跳转，改用输入框回车再试")
             try:
-                page.locator("#btn_query").first.click(timeout=4000)
+                page.locator("#keyword").first.press("Enter", timeout=4000)
             except Exception:
-                try:
-                    page.locator("#keyword").first.press("Enter", timeout=3000)
-                except Exception:
-                    pass
+                pass
             if self._wait_search_reaction(page, timeout=6):
                 reacted = True
                 break
@@ -572,13 +569,53 @@ class GsxtHandler(PlatformHandler):
             return False
 
     def _click_query(self, page) -> str:
-        """精确点【查询】：gsxt 的按钮 innerText 是空的，必须按 id 找。"""
+        """点【查询】：**优先真实鼠标点击**（浏览器认为可信的事件，站点脚本才响应），
+        再退回 JS 点击。gsxt 的按钮 innerText 是空的，必须按 id 找。
+
+        之前只做 JS `btn.click()`：站点若用 jQuery/原生 addEventListener 绑定且
+        校验事件可信度，就会「点了没反应」——这正是用户反馈的现象。
+        """
+        # 先清掉可能挡在前面的弹层
+        try:
+            page.evaluate("""()=>{
+              const closeBtns = [...document.querySelectorAll(
+                '.layui-layer-close, .popup-close, .close, [class*=close]')];
+              for(const c of closeBtns){
+                if(c.offsetWidth > 0 && c.offsetHeight > 0) c.click();
+              }
+            }""")
+        except Exception:
+            pass
+
+        # ① 真实鼠标点击
+        try:
+            loc = page.locator("#btn_query").first
+            loc.scroll_into_view_if_needed(timeout=3000)
+            loc.click(timeout=5000)
+            self.engine.log("  触发 gsxt 查询按钮：OK:TRUSTED_CLICK")
+            return "OK:TRUSTED_CLICK"
+        except Exception:
+            pass
+
+        # ② 按坐标点一次（按钮被遮挡时真实点击会失败，坐标点击仍可）
+        try:
+            box = page.evaluate("""()=>{
+              const b=document.getElementById('btn_query')
+                   || document.querySelector('.search_btn');
+              if(!b) return null;
+              const r=b.getBoundingClientRect();
+              if(r.width<2 || r.height<2) return null;
+              return {x:r.x+r.width/2, y:r.y+r.height/2};
+            }""")
+            if box:
+                page.mouse.click(box["x"], box["y"])
+                self.engine.log("  触发 gsxt 查询按钮：OK:MOUSE_CLICK")
+                return "OK:MOUSE_CLICK"
+        except Exception:
+            pass
+
+        # ③ 最后才用 JS 触发
         clicked = page.evaluate("""()=>{
-          // 先关闭可能残留的弹窗/模态层
-          const closeBtns = [...document.querySelectorAll('.layui-layer-close, .popup-close, .close, [class*=close]')];
-          for(const c of closeBtns){
-            if(c.offsetWidth > 0 && c.offsetHeight > 0) c.click();
-          }
           const btn = document.getElementById('btn_query')
                    || document.querySelector('.search_btn')
                    || [...document.querySelectorAll('button, a, input[type=button], input[type=submit]')]

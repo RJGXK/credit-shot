@@ -176,7 +176,11 @@ class BrowserSession:
             "--start-maximized",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-blink-features=AutomationControlled",
+            # 不要再加 --disable-blink-features=AutomationControlled：
+            # Edge/Chrome 会弹出「您使用的是不受支持的命令行标记」黄色提示条，
+            # 既影响截图观感，也等于自报「这是自动化浏览器」。
+            # 实测用 CDP 接管并不会把 navigator.webdriver 置真，
+            # 这个标记纯属多余，去掉后浏览器与正常窗口完全一致。
             "--no-service-autorun",
             "about:blank",
         ]

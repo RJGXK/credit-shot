@@ -578,11 +578,31 @@ class TestNavReferer(unittest.TestCase):
         nav.goto(_P(), "https://www.samr.gov.cn/")
         self.assertNotIn("referer", calls)
 
-    def test_gsxt_chain_fallback_carries_referer(self):
+    def test_gsxt_chain_has_no_direct_entry(self):
+        """gsxt 入口链只允许「从总局点进去」，不得出现直连目标站的条目。
+
+        用户明确要求：不要直接输入网址，要一步一步点进去（直连会被判审核不通过）。
+        """
         from core import nav
-        chain = nav.ENTRY_CHAINS["gsxt"]
-        self.assertTrue(any(s.get("referer") for s in chain),
-                        "gsxt 入口链的兜底直连必须带 referer")
+        for step in nav.ENTRY_CHAINS["gsxt"]:
+            self.assertTrue(step.get("match"),
+                            "gsxt 入口链出现了直连条目：%s" % step.get("landing"))
+            self.assertIn("samr.gov.cn", step.get("landing", ""),
+                          "gsxt 只允许从市场监管总局点进去")
+
+    def test_no_unsupported_browser_flags(self):
+        """启动参数里不许出现会弹黄条的命令行标记。
+
+        --disable-blink-features=AutomationControlled 会让 Edge 顶部出现
+        「您使用的是不受支持的命令行标记」提示条，等于自报自动化。
+        """
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "core", "browser.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        # 只查「参数列表里的字符串」，注释里提到这个标记名不算
+        self.assertNotIn('"--disable-blink-features', src,
+                         "浏览器启动参数里还有不受支持的标记")
 
     def test_every_site_has_default_referer(self):
         """每个站点都要有默认「上个网站」，否则裸跳必被 WAF 记异常。"""

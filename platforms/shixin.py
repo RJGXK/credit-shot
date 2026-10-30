@@ -57,14 +57,23 @@ class ShixinHandler(PlatformHandler):
         """
         url = step.get("url") or HOME_URLS["zxgk"]
         self.engine.log("打开：%s" % url)
-        # 从上级目录跳转进入（直连易被判异常）
+        # 从上级目录跳转进入；**不直接 goto 目标页**（用户要求：从第一步一步步点进去，
+        # 直接输网址会被判审核不通过）。进首页后在页面里点「失信被执行人」入口。
         nav.goto_via_landing(page, "zxgk", log=self.engine.log,
                              timeout_ms=self.engine.timeout * 1000)
-        try:
-            nav.goto(page, url, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log, referer=nav.site_referer("zxgk"))
-        except Exception as exc:
-            self.engine.log("  ⚠ 打开目标页异常：%s" % str(exc).splitlines()[0][:80])
+        r = page.evaluate("""()=>{
+          const norm=s=>(s||'').replace(/\\s+/g,'');
+          const as=[...document.querySelectorAll('a[href]')]
+            .filter(a=>/shixin|失信/.test((a.innerText||'')+ (a.getAttribute('href')||'')));
+          const hit=as.find(a=>norm(a.innerText||'').indexOf('失信')>=0) || as[0];
+          if(!hit) return 'NONE';
+          hit.click();
+          return 'CLICK:'+norm(hit.innerText||'').slice(0,20);
+        }""")
+        self.engine.log("  点进「失信被执行人」：%s" % str(r)[:60])
+        if not str(r).startswith("CLICK"):
+            self.engine.log("  ⚠ 首页上没找到失信被执行人入口，按当前页继续（不做直连）")
+        self.engine.sleep(2.5)
         self.wait_ready(page, "()=>!!document.getElementById('myform')", timeout=30)
         self.engine.sleep(1.5)
 

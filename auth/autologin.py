@@ -537,23 +537,11 @@ def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
                 except Exception:
                     pass
         time.sleep(1.5)
-    # 兜底：直接打开登录子站页
-    # 注意：真机实测登录页是 **socialuser-use-login.html**
-    #（老代码里写的 socialuser-use-rllogin.html 是另一个地址），
-    # 而且直连 shiming.gsxt.gov.cn 会被瑞数 WAF 拦成「Environment Checking」白页，
-    # 所以两个地址都试一遍，只认真正渲染出 #UserName 的那次。
-    for url in ("https://shiming.gsxt.gov.cn/socialuser-use-login.html",
-                "https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html"):
-        try:
-            # 带上「上个网站」（公示系统首页）：无来源直达会被瑞数判成异常
-            page.goto(url, wait_until="domcontentloaded", timeout=30000,
-                      referer="https://www.gsxt.gov.cn/index.html")
-            time.sleep(3)
-            if page.evaluate("()=>!!document.getElementById('UserName')"):
-                log("  ✔ 已直达 gsxt 登录页")
-                return True
-        except Exception:
-            pass
+    # 兜底：**不再直接打开登录子站网址**。
+    # 用户明确要求：不要直接输入网址，必须从首页一步一步点进去
+    # （直连 shiming 会被瑞数判成异常，登录也过不了审核）。
+    # 点不到「登录」就返回 False，由调用方挂起等人工在浏览器里操作。
+    log("  ⚠ 首页上没找到「登录」入口，未做直连跳转（避免被判异常）")
     return False
 
 

@@ -23,7 +23,7 @@ from web.api import router
 __all__ = ["create_app", "serve", "find_free_port", "open_browser", "resource_dir"]
 
 APP_NAME = "企业信用截图工具"
-APP_VERSION = "2.1.7"
+APP_VERSION = "2.1.8"
 
 # 打包成 exe 后，静态资源被收集到 PyInstaller 的解包目录下（sys._MEIPASS），
 # 而源码运行时它们就在 web/ 里。两种情况要分别取到正确的目录。
