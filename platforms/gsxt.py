@@ -33,6 +33,7 @@ class GsxtHandler(PlatformHandler):
         self._gsxt_in_detail = False
         self._gsxt_page = None
         self._gsxt_logged_in = False
+        self._gsxt_ip_blocked = False
 
     def collect_group(self, page, company: str, gsteps: list,
                             results: List[StepResult], shots: List[str]) -> None:
@@ -169,11 +170,21 @@ class GsxtHandler(PlatformHandler):
         # 后续所有等待/操作都打在**实际生效的那个页面**上
         page = self._gsxt_page or page
         for rnd in range(1, rounds + 1):
+            # IP 被风控时首页根本出不来（点查询也只会毫无反应）：
+            # 必须立刻停手，反复重走入口链只会被判得更死。
+            if self._detect_ip_blocked(page):
+                self._gsxt_ip_blocked = True
+                self._log_ip_blocked()
+                return False
             ok = self.wait_keyword(page, timeout=18)
             if ok:
                 if rnd > 1 or chain_res.get("via"):
                     self.engine.log("  gsxt 首页就绪（第 %d 次尝试）" % rnd)
                 return True
+            if self._detect_ip_blocked(page):
+                self._gsxt_ip_blocked = True
+                self._log_ip_blocked()
+                return False
             if rnd < rounds:
                 self.engine.log("  gsxt 首页未就绪，重新通过上级目录跳转进入（第 %d 次）" % (rnd + 1))
                 try:
@@ -190,6 +201,57 @@ class GsxtHandler(PlatformHandler):
         if not chain_res.get("ok"):
             self.engine.log("  提示：gsxt 环境校验较慢，继续尝试")
         return False
+
+    def _detect_ip_blocked(self, page) -> bool:
+        """判断当前页是不是「IP 被风控」提示页。
+
+        实测文案（2026-10-30）：
+          当前IP请求异常，请更换IP地址进行访问，或访问地址
+          （https://shiming.gsxt.gov.cn）实名注册/登录后再进行访问…
+          error: 您的IP最近有可疑的攻击行为，请稍后重试.
+        只匹配这几句特征文案——「实名注册」之类在正常登录页也有，不能当判据。
+        """
+        try:
+            r = page.evaluate("""()=>{
+              const b=(document.body&&document.body.innerText)||'';
+              if(!/当前IP请求异常|可疑的攻击行为|更换IP地址/.test(b)) return '';
+              return b.replace(/\\s+/g,' ').slice(0,200);
+            }""")
+        except Exception:
+            return False
+        if r:
+            self.engine.log("  ⚠ 命中公示系统 IP 风控页：%s" % str(r)[:120])
+            return True
+        return False
+
+    def _log_ip_blocked(self) -> None:
+        """把 IP 风控的解决路径写清楚（用户看到的排查依据）。"""
+        self.engine.log("  ⚠ 公示系统已限制本机 IP：直接查询会被拦截、页面刷新出来是 IP 异常提示。")
+        self.engine.log("    解决办法（任选其一）：① 换网络/IP（切换热点、代理或重启光猫换 IP）；")
+        self.engine.log("    ② 打开 https://shiming.gsxt.gov.cn 实名注册/登录后再查；③ 等一段时间再试。")
+
+    def _resolve_ip_block(self, page):
+        """IP 被风控后的补救：能实名登录就登录，否则挂起等用户处理。"""
+        self.engine.log("  gsxt 触发 IP 风控，改走实名登录通道（shiming.gsxt.gov.cn）")
+        ok = False
+        try:
+            # ensure_login 内部会自己打开实名认证子站的登录页
+            ok = self.ensure_login(page)
+        except (Aborted, Skipped):
+            raise
+        except Exception as exc:
+            self.engine.log("  自动登录异常：%s" % str(exc).splitlines()[0][:80])
+        if ok:
+            self.engine.log("  ✔ 实名登录成功，重新打开公示系统首页")
+        else:
+            self.engine.wait_manual(
+                "公示系统提示「当前IP请求异常 / 您的IP最近有可疑的攻击行为」，直接查询会被拦截。\n"
+                "请二选一：① 换一个网络或 IP（切换热点/代理）后重试；"
+                "② 在浏览器里打开 https://shiming.gsxt.gov.cn 完成实名登录。\n"
+                "处理好后点【继续】，程序会重新打开首页继续查询。")
+        self._gsxt_ip_blocked = False
+        self.open_portal(page)
+        return getattr(self, "_gsxt_page", None) or page
 
     def wait_keyword(self, page, timeout: int = 25) -> bool:
         """等 gsxt 搜索框 #keyword 可见。
@@ -246,7 +308,23 @@ class GsxtHandler(PlatformHandler):
             return True
         self.open_portal(page)
         page = getattr(self, "_gsxt_page", None) or page
+        # IP 被风控时首页都出不来：走实名登录/换 IP 的补救流程，别硬查
+        if getattr(self, "_gsxt_ip_blocked", False):
+            page = self._resolve_ip_block(page)
+            if self._detect_ip_blocked(page):
+                self.engine.log("  ⚠ 当前 IP 仍被限制，跳过自动查询（按当前画面截图）")
+                return False
         self._search_company(page, company)
+        # 点查询后才发现被风控（点了没反应）→ 同样走实名登录/换 IP 的补救，再搜一次
+        if getattr(self, "_gsxt_ip_blocked", False):
+            page = self._resolve_ip_block(page)
+            if self._detect_ip_blocked(page):
+                self.engine.log("  ⚠ 当前 IP 仍被限制，跳过自动查询（按当前画面截图）")
+                return False
+            self._search_company(page, company)
+            if getattr(self, "_gsxt_ip_blocked", False):
+                self.engine.log("  ⚠ IP 仍被公示系统限制，停止自动查询")
+                return False
 
         for round_no in range(1, 4):
             self.engine.wait_manual(
@@ -307,11 +385,20 @@ class GsxtHandler(PlatformHandler):
              → 重走入口链再来一轮（最多 3 轮）。
         """
         reacted = False
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
+            # 查询前先看是不是已经被风控（此时点按钮不会跳转，重试只会更糟）
+            if self._detect_ip_blocked(page):
+                self._gsxt_ip_blocked = True
+                self._log_ip_blocked()
+                return
             if attempt > 1:
                 self.engine.log("  ↻ 搜索没有反应，重走入口链再试（第 %d 轮）" % attempt)
                 self.open_portal(page)
                 page = getattr(self, "_gsxt_page", None) or page
+                if self._detect_ip_blocked(page):
+                    self._gsxt_ip_blocked = True
+                    self._log_ip_blocked()
+                    return
             self.engine.log("在 gsxt 首页搜索：%s" % company)
 
             # ---- 填词 + 回读校验（防止「看着填上了其实没写进去」）----
@@ -342,6 +429,13 @@ class GsxtHandler(PlatformHandler):
                 reacted = True
                 break
 
+            # 点完毫无反应时先确认是不是被风控——是就不再做任何
+            # 「真实点击 / 回车 / 重走入口链」，那些动作会加重 IP 风控。
+            if self._detect_ip_blocked(page):
+                self._gsxt_ip_blocked = True
+                self._log_ip_blocked()
+                return
+
             # ---- 回落：真实鼠标点击 / 回车 ----
             self.engine.log("  ⚠ 点【查询】后没有跳转，改用真实鼠标点击再试")
             try:
@@ -354,10 +448,15 @@ class GsxtHandler(PlatformHandler):
             if self._wait_search_reaction(page, timeout=6):
                 reacted = True
                 break
+            if self._detect_ip_blocked(page):
+                self._gsxt_ip_blocked = True
+                self._log_ip_blocked()
+                return
 
         if not reacted:
-            self.engine.log("  ⚠ 自动搜索始终没有跳转（已重试 3 轮）。"
-                            "请在浏览器里手动点【查询】完成搜索。")
+            self.engine.log("  ⚠ 自动搜索始终没有跳转（已重试 2 轮）。"
+                            "请在浏览器里手动点【查询】完成搜索；"
+                            "若页面提示 IP 异常，请换 IP 或到 shiming.gsxt.gov.cn 实名登录。")
 
     def _fill_keyword(self, page, company: str) -> bool:
         """把企业名称填进搜索框（原生 setter + input/change 事件）。"""

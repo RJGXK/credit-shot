@@ -458,5 +458,46 @@ class TestWenshuPhoneMask(unittest.TestCase):
         self.assertEqual(masked, "联系电话138****5678。")
 
 
+# ================================================================ GSXT IP 风控
+class TestGsxtIpBlock(unittest.TestCase):
+    """公示系统 IP 风控页的识别（风控文案变了要能及时发现）。"""
+
+    _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "platforms", "gsxt.py")
+
+    def test_detect_patterns_present(self):
+        with open(self._SRC, "r", encoding="utf-8") as f:
+            src = f.read()
+        for kw in ("当前IP请求异常", "可疑的攻击行为", "更换IP地址"):
+            self.assertIn(kw, src,
+                          "gsxt._detect_ip_blocked 缺少特征文案：%s" % kw)
+
+    def test_detect_returns_bool(self):
+        from types import SimpleNamespace
+
+        from platforms.gsxt import GsxtHandler
+
+        h = GsxtHandler.__new__(GsxtHandler)
+        logs = []
+        h.engine = SimpleNamespace(log=logs.append)
+
+        class _P:
+            def __init__(self, snippet):
+                self.snippet = snippet
+
+            def evaluate(self, js, arg=None):
+                return self.snippet
+
+        self.assertTrue(h._detect_ip_blocked(
+            _P("当前IP请求异常，请更换IP地址进行访问")))
+        self.assertTrue(any("IP 风控" in m for m in logs))
+        self.assertFalse(h._detect_ip_blocked(_P("")))
+        # evaluate 抛异常（页面跳转中）不能把流程打断
+        class _Bad:
+            def evaluate(self, js, arg=None):
+                raise RuntimeError("Execution context was destroyed")
+        self.assertFalse(h._detect_ip_blocked(_Bad()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
