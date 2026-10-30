@@ -578,17 +578,23 @@ class TestNavReferer(unittest.TestCase):
         nav.goto(_P(), "https://www.samr.gov.cn/")
         self.assertNotIn("referer", calls)
 
-    def test_gsxt_chain_has_no_direct_entry(self):
-        """gsxt 入口链只允许「从总局点进去」，不得出现直连目标站的条目。
+    def test_gsxt_chain_uses_search_engine(self):
+        """gsxt 入口必须包含「搜索引擎点进去」，且不得直连目标站。
 
-        用户明确要求：不要直接输入网址，要一步一步点进去（直连会被判审核不通过）。
+        用户实测（2026-10-30）：Bing 搜索 → 点结果 → 站内正常；
+        直接输网址 / 从门户链进去都会被判异常（点查询没反应）。
         """
         from core import nav
-        for step in nav.ENTRY_CHAINS["gsxt"]:
-            self.assertTrue(step.get("match"),
-                            "gsxt 入口链出现了直连条目：%s" % step.get("landing"))
-            self.assertIn("samr.gov.cn", step.get("landing", ""),
-                          "gsxt 只允许从市场监管总局点进去")
+        chain = nav.ENTRY_CHAINS["gsxt"]
+        self.assertTrue(any(s.get("search") for s in chain),
+                        "gsxt 入口链应包含搜索引擎入口")
+        for step in chain:
+            landing = step.get("landing") or ""
+            self.assertNotIn("gsxt.gov.cn", landing,
+                             "gsxt 入口链不得直接打开目标站：%s" % landing)
+            if landing:
+                self.assertTrue(step.get("match"),
+                                "落地页条目必须靠点链接进入：%s" % landing)
 
     def test_no_unsupported_browser_flags(self):
         """启动参数里不许出现会弹黄条的命令行标记。

@@ -34,6 +34,16 @@ _COMMON_BROWSER_DIRS = {
     ],
 }
 
+#: 会影响浏览器行为/外观的启动参数（不含端口与资料目录）。
+#: 改这里等于改变「指纹」：旧实例会被判定为过时并重启，
+#: 否则升级后用户会一直复用那个带着旧标记（顶部黄条）的实例。
+LAUNCH_FLAGS = [
+    "--start-maximized",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--no-service-autorun",
+]
+
 # 浏览器主程序文件名（Edge/Chrome 都是 exe 后缀的同名文件）
 _BROWSER_EXE_NAMES = {"Edge": "msedge.exe", "Chrome": "chrome.exe"}
 
@@ -158,8 +168,20 @@ class BrowserSession:
             os.path.expanduser("~"), ".credit_shot_profile", kind)
         os.makedirs(profile, exist_ok=True)
 
-        # 1) 复用已经开着、且带调试端口的同资料目录实例
+        # 1) 复用已经开着、且带调试端口的同资料目录实例。
+        # 但**必须先确认它是不是用当前这套启动参数起的**：
+        # 老版本实例可能带着 --disable-blink-features=AutomationControlled
+        # 之类的标记（浏览器顶部会有黄条，看着就像自动化）。参数变了就杀掉重开，
+        # 否则升级后用户永远复用到那个"脏"实例。
+        sig = self._launch_signature()
         reuse_port = self.read_reusable_port(profile)
+        if reuse_port:
+            old_sig = self.read_launch_sig(profile)
+            if old_sig != sig:
+                self.log("  ↻ 检测到启动参数已更新（旧实例带过时的命令行标记），重启%s…" % kind)
+                self.kill_stale_browsers(profile)
+                time.sleep(2.0)
+                reuse_port = None
         if reuse_port:
             self.log("复用已打开的 %s（调试端口 %d）…" % (kind, reuse_port))
             try:
@@ -173,20 +195,19 @@ class BrowserSession:
             exe,
             "--remote-debugging-port=%d" % port,
             "--user-data-dir=%s" % profile,
-            "--start-maximized",
-            "--no-first-run",
-            "--no-default-browser-check",
             # 不要再加 --disable-blink-features=AutomationControlled：
             # Edge/Chrome 会弹出「您使用的是不受支持的命令行标记」黄色提示条，
             # 既影响截图观感，也等于自报「这是自动化浏览器」。
             # 实测用 CDP 接管并不会把 navigator.webdriver 置真，
             # 这个标记纯属多余，去掉后浏览器与正常窗口完全一致。
-            "--no-service-autorun",
-            "about:blank",
-        ]
+        ] + LAUNCH_FLAGS + ["about:blank"]
         self.log("启动 %s（调试端口 %d，专用资料目录可保留登录态）…" % (kind, port))
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.proc = proc
+        try:
+            self.write_launch_sig(profile, sig)
+        except Exception:
+            pass
 
         endpoint = "http://127.0.0.1:%d" % port
         deadline = time.time() + 30
@@ -233,6 +254,32 @@ class BrowserSession:
     @staticmethod
     def port_file(profile: str) -> str:
         return os.path.join(profile, ".debug_port")
+
+    @staticmethod
+    def sig_file(profile: str) -> str:
+        return os.path.join(profile, ".launch_sig")
+
+    @staticmethod
+    def _launch_signature() -> str:
+        """当前启动参数的指纹（只算行为参数，端口/资料目录不参与）。"""
+        import hashlib
+        return hashlib.md5(("|".join(LAUNCH_FLAGS)).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def read_launch_sig(cls, profile: str) -> str:
+        try:
+            with open(cls.sig_file(profile), "r", encoding="utf-8") as f:
+                return (f.read() or "").strip()
+        except Exception:
+            return ""
+
+    @classmethod
+    def write_launch_sig(cls, profile: str, sig: str) -> None:
+        try:
+            with open(cls.sig_file(profile), "w", encoding="utf-8") as f:
+                f.write(sig)
+        except Exception:
+            pass
 
 
     @staticmethod

@@ -101,13 +101,18 @@ def nap(seconds: float) -> None:
 #: match      = 在落地页里找链接时的关键词（**按 host 精确匹配优先**）；
 #: expect_host= 点完链接后期望到达的 host（不等就换下一条链）。
 ENTRY_CHAINS = {
-    # 国家企业信用信息公示系统：直连必被瑞数拦成白页，
-    # 必须先落到「国家市场监督管理总局」再点「国家企业信用信息公示系统」。
-    # 注意 samr 首页上还有 ypzsx/tspjg/xwqy 等 gsxt 子站，
-    # 所以必须用 host 精确匹配 www.gsxt.gov.cn。
-    # **不再提供「直接打开 gsxt 首页」的兜底**：用户实测直接输入网址会被判审核不通过，
-    # 必须一步一步点进去；两条总局入口都失败就报错，交给人工处理。
+    # 国家企业信用信息公示系统。
+    # 用户实测（2026-10-30）：**从 Bing 搜索结果点进去能过**，
+    # 直接输网址、或从政府门户链进去都会被判异常（点查询没反应 / 400）。
+    # 所以把搜索引擎入口排第一，门户链仅作备用。
     "gsxt": [
+        {"search": "https://cn.bing.com/search?q=https%3A%2F%2Fwww.gsxt.gov.cn%2Findex.html",
+         "name_hint": "国家企业信用信息公示系统",
+         "expect_host": "www.gsxt.gov.cn"},
+        {"search": "https://www.baidu.com/s?wd=%E5%9B%BD%E5%AE%B6%E4%BC%81%E4%B8%9A"
+                   "%E4%BF%A1%E7%94%A8%E4%BF%A1%E6%81%AF%E5%85%AC%E7%A4%BA%E7%B3%BB%E7%BB%9F",
+         "name_hint": "国家企业信用信息公示系统",
+         "expect_host": "www.gsxt.gov.cn"},
         {"landing": "https://www.samr.gov.cn/", "match": "www.gsxt.gov.cn",
          "expect_host": "www.gsxt.gov.cn"},
         {"landing": "https://www.samr.gov.cn/xw/", "match": "www.gsxt.gov.cn",
@@ -407,6 +412,99 @@ def _wait_ready_patient(page, timeout: float = 20.0, allow_reload: bool = False,
     return st
 
 
+def _enter_via_search(page, search_url: str, name_hint: str,
+                      expect_host: str, log=print):
+    """通过**搜索引擎结果**点进目标站（用户实测最稳的进入方式）。
+
+    为什么要绕搜索引擎：站点 WAF 对「搜索来源」的放开度最高
+    （挡住搜索引擎会伤 SEO/收录）。用户手工走
+        Bing 搜索 → 点「国家企业信用信息公示系统」→ 站内一切正常，
+    而直接输网址、或从政府门户点进去都会被判异常。
+
+    注意：搜索结果链接经常带 ``target=_blank``，**点了会开新标签页**，
+    当前页仍停在搜索引擎上。所以这里必须能识别新标签页并返回它。
+
+    返回落地后的 page（可能是新标签页）；失败返回 None。
+    """
+    try:
+        goto(page, search_url, timeout_ms=45000, log=log)
+    except Exception as exc:
+        log("  ⚠ 搜索引擎打不开：%s" % str(exc).splitlines()[0][:60])
+        return None
+    nap(2.0)
+
+    js = """
+    (arg)=>{
+      const norm=s=>(s||'').replace(/\\s+/g,'');
+      const as=[...document.querySelectorAll('a[href]')].filter(a=>{
+        const t=(a.innerText||'').trim();
+        if(!t) return false;
+        const r=a.getBoundingClientRect();
+        return r.width>0 && r.height>0;
+      });
+      const hostOf=a=>{try{return new URL(a.href).host;}catch(e){return '';}};
+      // 1) href 的 host 就是目标站
+      let hit=as.find(a=>hostOf(a)===arg.host);
+      // 2) href（或其解码形态）里含目标域名
+      if(!hit) hit=as.find(a=>{
+        const h=a.href||'';
+        let d=''; try{d=decodeURIComponent(h);}catch(e){d=h;}
+        return h.indexOf(arg.host)>=0 || d.indexOf(arg.host)>=0;
+      });
+      // 3) 文字命中站名（搜索引擎的跳转链接 href 是加密的，只能看文字）
+      if(!hit && arg.hint) hit=as.find(a=>norm(a.innerText).indexOf(norm(arg.hint))>=0);
+      if(!hit) return 'NONE';
+      hit.click();
+      return 'CLICK:'+(hit.href||'').slice(0,90);
+    }
+    """
+    try:
+        r = str(page.evaluate(js, {"host": expect_host, "hint": name_hint}))
+    except Exception as exc:
+        r = "ERR:%s" % str(exc).splitlines()[0][:60]
+    log("  搜索结果点击：%s" % r[:100])
+    if not r.startswith("CLICK"):
+        return None
+
+    # 等落地：可能当前页直接跳走，也可能开了新标签页（target=_blank）
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        try:
+            host = str(page.evaluate("()=>location.host") or "")
+        except Exception:
+            host = ""
+        if expect_host and expect_host in host:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            try:
+                cur = str(page.evaluate("()=>location.href") or "")
+            except Exception:
+                cur = ""
+            log("  ✔ 经搜索引擎进入：%s" % cur[:80])
+            return page
+        # 新标签页
+        newp = _find_new_page(page, expect_host)
+        if newp is not None:
+            try:
+                newp.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            nap(1.5)
+            try:
+                host2 = str(newp.evaluate("()=>location.host") or "")
+            except Exception:
+                host2 = ""
+            if expect_host and expect_host in host2:
+                log("  ✔ 经搜索引擎进入（新标签页）：%s"
+                    % str(getattr(newp, "url", "") or "")[:80])
+                return newp
+        nap(1.5)
+    log("  ⚠ 搜索结果没有跳到目标站（可能被拦或链接失效）")
+    return None
+
+
 def goto_via_landing(page, site_key: str, log=print,
                      timeout_ms: int = 45000) -> dict:
     """按入口链「从上级目录跳转」进入站点，返回最终页面状态。
@@ -430,6 +528,30 @@ def goto_via_landing(page, site_key: str, log=print,
         # 否则等于裸奔进站，会被 WAF 记成异常来源。
         if not referer and not match:
             referer = site_referer(site_key)
+
+        # ---- 搜索引擎入口（优先）----
+        search_url = step.get("search") or ""
+        if search_url:
+            landed = _enter_via_search(page, search_url,
+                                       step.get("name_hint", ""),
+                                       expect_host, log=log)
+            if landed is not None:
+                # 新标签页要拿到前台，否则后台标签的渲染/定时器会被节流
+                try:
+                    landed.bring_to_front()
+                except Exception:
+                    pass
+                st = _wait_ready_patient(landed, timeout=12.0)
+                log("  搜索引擎落地：len=%s blank=%s checking=%s"
+                    % (st.get("len"), st.get("blank"), st.get("checking")))
+                # **host 对上就算进来了**：正文可能还在跑瑞数/加速乐的环境挑战，
+                # 交给调用方去等真正的就绪条件（gsxt 等 #keyword，最多 18s×N 轮）。
+                # 以前这里要求 len>200 才返回，挑战页会把刚点进来的页面判失败，
+                # 整条链继续往下走，反而把已经到手的页面丢了。
+                return {"ok": True, "state": st, "via": "search", "page": landed}
+            last = {"ok": False, "reason": "搜索引擎入口未成功"}
+            continue
+
         if not landing:
             continue
         try:

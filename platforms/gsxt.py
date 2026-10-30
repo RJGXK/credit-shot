@@ -476,6 +476,13 @@ class GsxtHandler(PlatformHandler):
                     return
             self.engine.log("在 gsxt 首页搜索：%s" % company)
 
+            # 等页面完全加载（geetest 与站点脚本绑定完再点，否则点了没反应）
+            try:
+                page.wait_for_function("()=>document.readyState==='complete'",
+                                       timeout=15000)
+            except Exception:
+                pass
+
             # ---- 填词 + 回读校验（防止「看着填上了其实没写进去」）----
             filled = False
             for fill_attempt in range(1, 4):
