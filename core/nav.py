@@ -202,7 +202,15 @@ def goto(page, url: str, timeout_ms: int = 45000,
     if referer:
         kwargs["referer"] = referer
     try:
-        page.goto(url, wait_until=wait_until, timeout=timeout_ms, **kwargs)
+        resp = page.goto(url, wait_until=wait_until, timeout=timeout_ms, **kwargs)
+        # 4xx/5xx 必须进日志：gsxt 的 400 就是「会话票据被判废」的典型表现，
+        # 不打出来根本不知道是站点拒绝，而不是页面没渲染。
+        try:
+            code = getattr(resp, "status", None) if resp is not None else None
+        except Exception:
+            code = None
+        if isinstance(code, int) and code >= 400:
+            log("  ⚠ 站点返回 HTTP %d：%s" % (code, url[:70]))
         return True
     except Exception as exc:
         if _is_interrupted(exc):

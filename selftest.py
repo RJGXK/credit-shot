@@ -490,13 +490,61 @@ class TestGsxtIpBlock(unittest.TestCase):
 
         self.assertTrue(h._detect_ip_blocked(
             _P("当前IP请求异常，请更换IP地址进行访问")))
-        self.assertTrue(any("IP 风控" in m for m in logs))
+        self.assertTrue(any("拒绝页" in m for m in logs))
         self.assertFalse(h._detect_ip_blocked(_P("")))
         # evaluate 抛异常（页面跳转中）不能把流程打断
         class _Bad:
             def evaluate(self, js, arg=None):
                 raise RuntimeError("Execution context was destroyed")
         self.assertFalse(h._detect_ip_blocked(_Bad()))
+
+    def test_detect_http_400_page(self):
+        """HTTP 400 的拒绝页也要认（抓包实测：票据判废时站点直接 400）。"""
+        from types import SimpleNamespace
+
+        from platforms.gsxt import GsxtHandler
+
+        h = GsxtHandler.__new__(GsxtHandler)
+        h.engine = SimpleNamespace(log=lambda *a, **k: None)
+
+        class _P:
+            def evaluate(self, js, arg=None):
+                return "400 Bad Request"
+
+        self.assertTrue(h._detect_ip_blocked(_P()))
+
+    def test_clear_site_cookies_uses_cdp_per_origin(self):
+        """清票据必须按站点清（Storage.clearDataForOrigin），
+        不能一把 clear_cookies 把裁判文书网登录态也清了。"""
+        from types import SimpleNamespace
+
+        from platforms.gsxt import GsxtHandler
+
+        h = GsxtHandler.__new__(GsxtHandler)
+        logs = []
+        h.engine = SimpleNamespace(log=logs.append)
+        sent = []
+
+        class _CDP:
+            def send(self, method, params):
+                sent.append((method, params.get("origin")))
+
+        class _Ctx:
+            def new_cdp_session(self, page):
+                return _CDP()
+
+            def clear_cookies(self):
+                raise AssertionError("不应该走全量清 Cookie 的兜底")
+
+        class _P:
+            context = _Ctx()
+
+        self.assertTrue(h._clear_site_cookies(_P()))
+        methods = [m for m, _ in sent]
+        origins = [o for _, o in sent]
+        self.assertTrue(all(m == "Storage.clearDataForOrigin" for m in methods))
+        self.assertIn("https://www.gsxt.gov.cn", origins)
+        self.assertIn("https://shiming.gsxt.gov.cn", origins)
 
 
 # ============================================================ 入口链 / Referer

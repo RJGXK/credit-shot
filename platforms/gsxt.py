@@ -195,6 +195,15 @@ class GsxtHandler(PlatformHandler):
                 self._gsxt_ip_blocked = True
                 self._log_ip_blocked()
                 return False
+            # 静默 400/白页也要兜住：站点判废票据时不一定给提示文案，
+            # 有时就是一张空白页（HTTP 400 + 无正文）。
+            st = nav.nav_state(page)
+            if (rnd == 1 and not st.get("checking")
+                    and (st.get("blank") or st.get("len", 0) < 60)):
+                self.engine.log("  ⚠ 首页空白/被拒（可能旧会话票据被判废），清票据后重试")
+                self._clear_site_cookies(page)
+                self.engine.sleep(1.5)
+                # 不 continue：让下面的「重走入口链」分支把页面重新带起来
             if rnd < rounds:
                 self.engine.log("  gsxt 首页未就绪，重新通过上级目录跳转进入（第 %d 次）" % (rnd + 1))
                 try:
@@ -213,36 +222,90 @@ class GsxtHandler(PlatformHandler):
         return False
 
     def _detect_ip_blocked(self, page) -> bool:
-        """判断当前页是不是「IP 被风控」提示页。
+        """判断当前页是不是「IP 被风控 / 会话票据被判废」的拒绝页。
 
         实测文案（2026-10-30）：
           当前IP请求异常，请更换IP地址进行访问，或访问地址
           （https://shiming.gsxt.gov.cn）实名注册/登录后再进行访问…
           error: 您的IP最近有可疑的攻击行为，请稍后重试.
+        另有一类直接是 **HTTP 400 Bad Request**（抓包确认：请求头/UA/Referer
+        都正常，但带着旧的 __jsl_clearance_s / SECTOKEN 票据被服务器判废）。
         只匹配这几句特征文案——「实名注册」之类在正常登录页也有，不能当判据。
         """
         try:
             r = page.evaluate("""()=>{
               const b=(document.body&&document.body.innerText)||'';
-              if(!/当前IP请求异常|可疑的攻击行为|更换IP地址/.test(b)) return '';
+              const bad=/当前IP请求异常|可疑的攻击行为|更换IP地址/.test(b)
+                     || /400 Bad Request/i.test(b);
+              if(!bad) return '';
               return b.replace(/\\s+/g,' ').slice(0,200);
             }""")
         except Exception:
             return False
         if r:
-            self.engine.log("  ⚠ 命中公示系统 IP 风控页：%s" % str(r)[:120])
+            self.engine.log("  ⚠ 命中公示系统拒绝页：%s" % str(r)[:120])
             return True
         return False
 
+    def _clear_site_cookies(self, page, origins=None) -> bool:
+        """清掉公示系统的旧会话票据（加速乐 __jsl_clearance_s / 瑞数 SECTOKEN 等）。
+
+        为什么要清：软件用的是**专用浏览器资料目录**，票据会一直留着。
+        一旦 WAF 把那套票据判废（换 IP、长时间闲置、自动化行为被判可疑），
+        之后每个请求都 400 —— 表现就是「页面打不开 / 点查询毫无反应」，
+        而用户自己的浏览器没有这套脏票据，一切正常。
+        按站点清（不清全库），避免把裁判文书网的登录态一起丢掉。
+        """
+        origins = origins or ["https://www.gsxt.gov.cn",
+                              "https://shiming.gsxt.gov.cn"]
+        cleared = False
+        try:
+            cdp = page.context.new_cdp_session(page)
+            for origin in origins:
+                try:
+                    cdp.send("Storage.clearDataForOrigin",
+                             {"origin": origin,
+                              "storageTypes": "cookies,local_storage,session_storage"})
+                    cleared = True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not cleared:
+            # 拿不到 CDP 会话时退化为清全部 Cookie：会连带丢掉裁判文书网登录态
+            # （下次会自动重新登录），但总比一直 400 强。
+            try:
+                page.context.clear_cookies()
+                cleared = True
+            except Exception:
+                pass
+        self.engine.log("  %s 公示系统旧会话票据（%s）"
+                        % ("✔ 已清理" if cleared else "⚠ 清理失败",
+                           "按站点" if cleared else "-"))
+        return cleared
+
     def _log_ip_blocked(self) -> None:
-        """把 IP 风控的解决路径写清楚（用户看到的排查依据）。"""
-        self.engine.log("  ⚠ 公示系统已限制本机 IP：直接查询会被拦截、页面刷新出来是 IP 异常提示。")
-        self.engine.log("    解决办法（任选其一）：① 换网络/IP（切换热点、代理或重启光猫换 IP）；")
-        self.engine.log("    ② 打开 https://shiming.gsxt.gov.cn 实名注册/登录后再查；③ 等一段时间再试。")
+        """把被拒绝的解决路径写清楚（用户看到的排查依据）。"""
+        self.engine.log("  ⚠ 公示系统拒绝了本机请求（IP 风控 / 设备票据被判废 / HTTP 400）。")
+        self.engine.log("    解决办法：① 换网络/IP（切换热点、代理或重启光猫）；")
+        self.engine.log("    ② 在界面把「浏览器」从 Edge 换成 Chrome（或反之）再试 ——")
+        self.engine.log("       实测同一台机器：Edge 那份资料被判废时，Chrome 能正常查询；")
+        self.engine.log("    ③ 打开 https://shiming.gsxt.gov.cn 实名登录后再查；④ 等一段时间再试。")
 
     def _resolve_ip_block(self, page):
-        """IP 被风控后的补救：能实名登录就登录，否则挂起等用户处理。"""
-        self.engine.log("  gsxt 触发 IP 风控，改走实名登录通道（shiming.gsxt.gov.cn）")
+        """被风控（含 HTTP 400）后的补救：先清票据重试，再实名登录/换 IP。"""
+        # ---- 第一步：清掉判废的会话票据，重走入口链 ----
+        self.engine.log("  gsxt 被拒绝（IP 风控 / HTTP 400）：先清掉本站旧票据再试一次")
+        self._clear_site_cookies(page)
+        self._gsxt_ip_blocked = False
+        ok_portal = self.open_portal(page)
+        page = getattr(self, "_gsxt_page", None) or page
+        if ok_portal and not self._detect_ip_blocked(page):
+            self.engine.log("  ✔ 清票据后恢复正常")
+            return page
+
+        # ---- 第二步：还是被拦 → 实名登录 / 换 IP ----
+        self.engine.log("  ⚠ 清票据后仍被拦截，改走实名登录通道（shiming.gsxt.gov.cn）")
         ok = False
         try:
             # ensure_login 内部会自己打开实名认证子站的登录页
@@ -255,9 +318,11 @@ class GsxtHandler(PlatformHandler):
             self.engine.log("  ✔ 实名登录成功，重新打开公示系统首页")
         else:
             self.engine.wait_manual(
-                "公示系统提示「当前IP请求异常 / 您的IP最近有可疑的攻击行为」，直接查询会被拦截。\n"
-                "请二选一：① 换一个网络或 IP（切换热点/代理）后重试；"
-                "② 在浏览器里打开 https://shiming.gsxt.gov.cn 完成实名登录。\n"
+                "公示系统拒绝了本机请求（「当前IP请求异常 / IP 有可疑攻击行为」或 HTTP 400）。\n"
+                "程序已自动清理过本站旧 Cookie，仍被拦截。请任选其一：\n"
+                "① 换一个网络或 IP（切换热点/代理）后重试；\n"
+                "② 在界面把「浏览器」Edge ↔ Chrome 换一个再试（实测另一浏览器可正常查询）；\n"
+                "③ 在浏览器里打开 https://shiming.gsxt.gov.cn 完成实名登录。\n"
                 "处理好后点【继续】，程序会重新打开首页继续查询。")
         self._gsxt_ip_blocked = False
         self.open_portal(page)
@@ -316,13 +381,13 @@ class GsxtHandler(PlatformHandler):
         """
         if getattr(self, "_gsxt_in_detail", False):
             return True
-        self.open_portal(page)
+        ok_portal = self.open_portal(page)
         page = getattr(self, "_gsxt_page", None) or page
-        # IP 被风控时首页都出不来：走实名登录/换 IP 的补救流程，别硬查
-        if getattr(self, "_gsxt_ip_blocked", False):
+        # 首页没起来（风控 / 票据判废 / 空白页）都走补救：清票据 → 重进 → 必要时登录
+        if not ok_portal or getattr(self, "_gsxt_ip_blocked", False):
             page = self._resolve_ip_block(page)
             if self._detect_ip_blocked(page):
-                self.engine.log("  ⚠ 当前 IP 仍被限制，跳过自动查询（按当前画面截图）")
+                self.engine.log("  ⚠ 仍然被限制，跳过自动查询（按当前画面截图）")
                 return False
         self._search_company(page, company)
         # 点查询后才发现被风控（点了没反应）→ 同样走实名登录/换 IP 的补救，再搜一次
