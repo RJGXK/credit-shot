@@ -402,10 +402,31 @@ class GsxtHandler(PlatformHandler):
                 return False
 
         for round_no in range(1, 4):
+            # 极验可能根本没弹出来（隐藏容器曾导致误判已修，但站点行为会变）：
+            # 挂起前先看一眼，没弹就自动**再真实点一次【查询】**，不干等用户。
+            if round_no == 1:
+                try:
+                    st = page.evaluate("""()=>{
+                      const els=[...document.querySelectorAll('[class*=geetest],[id*=geetest]')];
+                      const vis=els.some(e=>{
+                        let s=null; try{s=getComputedStyle(e);}catch(err){return false;}
+                        if(s.display==='none'||s.visibility==='hidden') return false;
+                        const b=e.getBoundingClientRect();
+                        return b.width>100&&b.height>60;});
+                      return {vis:vis, url:location.href,
+                              listing:/corp-query-search/.test(location.href)};
+                    }""")
+                except Exception:
+                    st = {}
+                if not st.get("listing") and not st.get("vis"):
+                    self.engine.log("  ⚠ 验证弹层没有出现，自动再点一次【查询】")
+                    self._click_query(page)
+                    self._wait_search_reaction(page, timeout=8)
+
             self.engine.wait_manual(
-                "gsxt 已搜索「%s」：请完成验证码/滑块，并在企业列表中点击该企业进入详情页"
-                "（新标签页先显示 Environment Checking，等几秒会自动放行，不要刷新）。"
-                "若点【查询】后没跳转到企业列表，请手动再点一次【查询】。"
+                "gsxt 已搜索「%s」：请在浏览器里完成验证码/滑块，并在企业列表中点击该企业"
+                "进入详情页（新标签页先显示 Environment Checking，等几秒会自动放行，不要刷新）。\n"
+                "若验证码一直不出现，点【跳过此步】程序会自动重试；"
                 "进入详情页后点【继续】。" % company)
             try:
                 pages = list(page.context.pages)
@@ -639,10 +660,19 @@ class GsxtHandler(PlatformHandler):
         return str(clicked)
 
     def _wait_search_reaction(self, page, timeout: float = 6.0) -> bool:
-        """等搜索「有反应」：任一标签页跳到结果页，或验证弹层出现。
+        """等搜索「有反应」：任一标签页跳到结果页，或验证弹层**真的显示**。
 
         之前的问题是点完就 blind sleep(3)，跳没跳转完全不知道，
         用户看到的就是「搜了但不动」。
+
+        实测坑（2026-10-30 用户日志）：点击同一秒就报「✔ 已触发验证」，
+        然后挂起等用户——用户那边什么都没弹，只能点跳过。
+        根因：gsxt 页面模板里常留**隐藏的 geetest 容器**（登录模块
+        `_gsxt_has_geetest` 早有同样记录），`getBoundingClientRect`
+        只量出尺寸、看不出 visibility/display/是否在遮罩层里，
+        导致隐藏容器被误判成「已弹出」。
+        现在复用登录模块的严格判据：display/visibility 正常 + 尺寸足够
+        + 页面上真的有「点选…」这类极验正文。
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -657,10 +687,22 @@ class GsxtHandler(PlatformHandler):
             except Exception:
                 pass
             try:
-                has_gt = page.evaluate(
-                    "()=>{const e=document.querySelector('.geetest_holder,.geetest_panel,#popup-captcha');"
-                    "if(!e) return false; const r=e.getBoundingClientRect();"
-                    "return r.width>40 && r.height>40;}")
+                has_gt = page.evaluate("""()=>{
+                  const els=[...document.querySelectorAll(
+                    '.geetest_holder,.geetest_panel,.geetest_window,[id*=geetest],[class*=geetest],#popup-captcha')];
+                  return els.some(e=>{
+                    let st=null;
+                    try{ st=getComputedStyle(e);}catch(err){ return false;}
+                    if(st.display==='none'||st.visibility==='hidden'||+st.opacity===0) return false;
+                    const b=e.getBoundingClientRect();
+                    if(b.width<=100||b.height<=60) return false;
+                    // 视口内才算弹层（隐藏模板容器常在文档底部量出巨大尺寸）
+                    if(b.bottom<0||b.right<0||
+                       b.top>(window.innerHeight||9999)||b.left>(window.innerWidth||9999)) return false;
+                    const t=(e.innerText||'');
+                    return /请点击|请依次|点选|拖动滑块|完成验证|验证码/.test(t) || !!e.querySelector('img');
+                  });
+                }""")
                 if has_gt:
                     self.engine.log("  ✔ 已触发验证（极验/图形验证码）")
                     return True
