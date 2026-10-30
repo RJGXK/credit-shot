@@ -408,23 +408,41 @@ class GsxtHandler(PlatformHandler):
           当前IP请求异常，请更换IP地址进行访问，或访问地址
           （https://shiming.gsxt.gov.cn）实名注册/登录后再进行访问…
           error: 您的IP最近有可疑的攻击行为，请稍后重试.
-        另有一类直接是 **HTTP 400 Bad Request**（抓包确认：请求头/UA/Referer
-        都正常，但带着旧的 __jsl_clearance_s / SECTOKEN 票据被服务器判废）。
-        只匹配这几句特征文案——「实名注册」之类在正常登录页也有，不能当判据。
+        另有一类直接是 **HTTP 400 Bad Request**（用户抓包实锤：响应头带
+        x-via-jsl，请求带着旧的 __jsl_clearance_s / SECTOKEN / CT_* 票据
+        被加速乐判废；此时页面正文可能很短甚至为空，只靠文案会漏判）。
+        判据：① 页面文案；② 关键判废票据仍在 + 正文异常短（400 的典型形态）。
         """
         try:
-            r = page.evaluate("""()=>{
+            lp = self._live_page(page)
+            if lp is None:
+                return False
+            r = lp.evaluate("""()=>{
               const b=(document.body&&document.body.innerText)||'';
               const bad=/当前IP请求异常|可疑的攻击行为|更换IP地址/.test(b)
                      || /400 Bad Request/i.test(b);
-              if(!bad) return '';
-              return b.replace(/\\s+/g,' ').slice(0,200);
+              return {bad:bad, len:(b||'').length,
+                      snippet:b.replace(/\\s+/g,' ').slice(0,160)};
             }""")
         except Exception:
             return False
-        if r:
-            self.engine.log("  ⚠ 命中公示系统拒绝页：%s" % str(r)[:120])
+        if r and r.get("bad"):
+            self.engine.log("  ⚠ 命中公示系统拒绝页：%s" % str(r.get("snippet"))[:120])
             return True
+        # 400 判废的静默形态：正文异常短 + 票据还在
+        if r is not None and r.get("len", 999) <= 40:
+            try:
+                cks = lp.context.cookies(urls=["https://www.gsxt.gov.cn"])
+                names = [str(c.get("name") or "") for c in cks]
+                stale = [n for n in ("__jsl_clearance_s", "SECTOKEN", "__jsluid_s")
+                         if n in names]
+                if stale:
+                    self.engine.log("  ⚠ 疑似 HTTP 400 判废：正文仅 %d 字符，"
+                                    "且旧票据仍在（%s）"
+                                    % (r.get("len", 0), "、".join(stale)))
+                    return True
+            except Exception:
+                pass
         return False
 
     def _clear_site_cookies(self, page, origins=None) -> bool:
@@ -435,12 +453,46 @@ class GsxtHandler(PlatformHandler):
         之后每个请求都 400 —— 表现就是「页面打不开 / 点查询毫无反应」，
         而用户自己的浏览器没有这套脏票据，一切正常。
         按站点清（不清全库），避免把裁判文书网的登录态一起丢掉。
+
+        v2.2.9 修正（用户抓包实锤 400 + 18:04:28「清理失败」）：
+          · 传入的 page 可能已死 → **先解析引擎活页**再清理，
+            否则 CDP 会话建不起来、清理静默失败、旧票据一直在、反复 400；
+          · 清理后**回读 Cookie 核对**，把关键票据（__jsluid_s/__jsl_clearance_s/
+            SECTOKEN/JSESSIONID）是否真被清掉写进日志——给排查留确凿证据。
         """
         origins = origins or ["https://www.gsxt.gov.cn",
-                              "https://shiming.gsxt.gov.cn"]
+                              "https://gsxt.gov.cn",
+                              "https://shiming.gsxt.gov.cn",
+                              "http://www.gsxt.gov.cn"]
+        # 传入页可能已死：优先解析活页，退而求其次用引擎主页
+        lp = self._live_page(page)
+        if lp is None:
+            try:
+                eng = getattr(self.engine, "browser_session", None)
+                cand = getattr(eng, "page", None)
+                if cand is not None and not cand.is_closed():
+                    lp = cand
+            except Exception:
+                lp = None
+        if lp is None:
+            self.engine.log("  ⚠ 清理失败：浏览器里没有可用标签页，无法执行清理")
+            return False
+
+        def _snap():
+            try:
+                cks = lp.context.cookies(urls=["https://www.gsxt.gov.cn",
+                                               "https://shiming.gsxt.gov.cn"])
+                return [str(c.get("name") or "") for c in cks]
+            except Exception:
+                return []
+
+        key_tickets = ("__jsluid_s", "__jsl_clearance_s", "SECTOKEN", "JSESSIONID")
+        before = _snap()
+        targets = [c for c in before if c in key_tickets]
+
         cleared = False
         try:
-            cdp = page.context.new_cdp_session(page)
+            cdp = lp.context.new_cdp_session(lp)
             for origin in origins:
                 try:
                     cdp.send("Storage.clearDataForOrigin",
@@ -449,19 +501,34 @@ class GsxtHandler(PlatformHandler):
                     cleared = True
                 except Exception:
                     continue
+            try:
+                cdp.detach()
+            except Exception:
+                pass
         except Exception:
             pass
         if not cleared:
             # 拿不到 CDP 会话时退化为清全部 Cookie：会连带丢掉裁判文书网登录态
             # （下次会自动重新登录），但总比一直 400 强。
             try:
-                page.context.clear_cookies()
+                lp.context.clear_cookies()
                 cleared = True
+                self.engine.log("  ⚠ 按站点清理不可用，已清空全部 Cookie"
+                                "（裁判文书网登录态会丢，下次自动重登）")
             except Exception:
                 pass
-        self.engine.log("  %s 公示系统旧会话票据（%s）"
-                        % ("✔ 已清理" if cleared else "⚠ 清理失败",
-                           "按站点" if cleared else "-"))
+        if cleared:
+            after = _snap()
+            remain = [c for c in targets if c in after]
+            if targets:
+                self.engine.log("  票据核对：%s %s"
+                                % ("、".join(targets),
+                                   "已全部清除" if not remain
+                                   else "仍有残留（%s）" % "、".join(remain)))
+            self.engine.log("  ✔ 已清理 公示系统旧会话票据（按站点，Cookie %d → %d 枚）"
+                            % (len(before), len(after)))
+        else:
+            self.engine.log("  ⚠ 清理失败 公示系统旧会话票据（-）")
         return cleared
 
     def _log_ip_blocked(self) -> None:
@@ -474,6 +541,9 @@ class GsxtHandler(PlatformHandler):
 
     def _resolve_ip_block(self, page):
         """被风控（含 HTTP 400）后的补救：先清票据重试，再实名登录/换 IP。"""
+        # 传入页可能已死（上一轮重试换过页）：先解析活页，
+        # 否则清票据和后续登录都会静默失败（18:04:28「清理失败」实锤）
+        page = self._live_page(page) or page
         # ---- 第一步：清掉判废的会话票据，重走入口链 ----
         self.engine.log("  gsxt 被拒绝（IP 风控 / HTTP 400）：先清掉本站旧票据再试一次")
         self._clear_site_cookies(page)
@@ -484,26 +554,45 @@ class GsxtHandler(PlatformHandler):
             self.engine.log("  ✔ 清票据后恢复正常")
             return page
 
-        # ---- 第二步：还是被拦 → 实名登录 / 换 IP ----
-        self.engine.log("  ⚠ 清票据后仍被拦截，改走实名登录通道（shiming.gsxt.gov.cn）")
-        ok = False
+        # ---- 第二步：还是被拦 → 重启浏览器进程（新进程+新票据）再试一次 ----
+        # 探针实锤（2026-10-29）：同一套代码+同 Profile，**新进程**搜索链全程正常；
+        # 复用旧进程时被加速乐判废的票据/进程内状态会一直 400。
+        # 清票据只清了存储，进程内的会话状态还在——重启才能拿到全新票据。
+        self.engine.log("  ⚠ 清票据后仍被拦截，重启浏览器进程获取全新票据后再试")
         try:
-            # ensure_login 内部会自己打开实名认证子站的登录页
-            ok = self.ensure_login(page)
-        except (Aborted, Skipped):
-            raise
+            bs = getattr(self.engine, "browser_session", None)
+            if bs is not None:
+                bs.close()
+                self.engine.sleep(2.0)
+                pw2, b2, ctx2, pg2 = bs.open()
+                self.engine.log("  ✔ 浏览器已重启（新进程），重新进入公示系统")
+                page = pg2
         except Exception as exc:
-            self.engine.log("  自动登录异常：%s" % str(exc).splitlines()[0][:80])
-        if ok:
-            self.engine.log("  ✔ 实名登录成功，重新打开公示系统首页")
-        else:
-            self.engine.wait_manual(
-                "公示系统拒绝了本机请求（「当前IP请求异常 / IP 有可疑攻击行为」或 HTTP 400）。\n"
-                "程序已自动清理过本站旧 Cookie，仍被拦截。请任选其一：\n"
-                "① 换一个网络或 IP（切换热点/代理）后重试；\n"
-                "② 在界面把「浏览器」Edge ↔ Chrome 换一个再试（实测另一浏览器可正常查询）；\n"
-                "③ 在浏览器里打开 https://shiming.gsxt.gov.cn 完成实名登录。\n"
-                "处理好后点【继续】，程序会重新打开首页继续查询。")
+            self.engine.log("  ⚠ 重启浏览器失败：%s，改走实名登录通道"
+                            % str(exc).splitlines()[0][:60])
+            page = self._live_page(page) or page
+
+        # ---- 第三步：重启后仍被拦 → 实名登录 / 换 IP ----
+        if self._detect_ip_blocked(page):
+            self.engine.log("  ⚠ 重启后仍被拦截，改走实名登录通道（shiming.gsxt.gov.cn）")
+            ok = False
+            try:
+                # ensure_login 内部会自己打开实名认证子站的登录页
+                ok = self.ensure_login(page)
+            except (Aborted, Skipped):
+                raise
+            except Exception as exc:
+                self.engine.log("  自动登录异常：%s" % str(exc).splitlines()[0][:80])
+            if ok:
+                self.engine.log("  ✔ 实名登录成功，重新打开公示系统首页")
+            else:
+                self.engine.wait_manual(
+                    "公示系统拒绝了本机请求（「当前IP请求异常 / IP 有可疑攻击行为」或 HTTP 400）。\n"
+                    "程序已自动清理过本站旧 Cookie 并重启过浏览器，仍被拦截。请任选其一：\n"
+                    "① 换一个网络或 IP（切换热点/代理）后重试；\n"
+                    "② 在界面把「浏览器」Edge ↔ Chrome 换一个再试（实测另一浏览器可正常查询）；\n"
+                    "③ 在浏览器里打开 https://shiming.gsxt.gov.cn 完成实名登录。\n"
+                    "处理好后点【继续】，程序会重新打开首页继续查询。")
         self._gsxt_ip_blocked = False
         self.open_portal(page)
         return getattr(self, "_gsxt_page", None) or page

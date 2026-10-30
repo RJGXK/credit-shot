@@ -535,18 +535,52 @@ class TestGsxtIpBlock(unittest.TestCase):
         h.engine = SimpleNamespace(log=logs.append)
 
         class _P:
+            """v2.2.9 起检测脚本返回 dict（含 bad/len/snippet），并需通过 _live_page。"""
+
             def __init__(self, snippet):
                 self.snippet = snippet
+                self._closed = False
+
+            def is_closed(self):
+                return self._closed
+
+            @property
+            def context(self):
+                return self
+
+            @property
+            def pages(self):
+                return [self]
 
             def evaluate(self, js, arg=None):
-                return self.snippet
+                if "location.href" in js and "detail" in js:
+                    return {}
+                b = self.snippet if isinstance(self.snippet, str) else ""
+                return {"bad": any(k in b for k in (
+                            "当前IP请求异常", "可疑的攻击行为", "更换IP地址"))
+                        or "400 Bad Request" in b,
+                        "len": len(b),
+                        "snippet": b[:160]}
 
-        self.assertTrue(h._detect_ip_blocked(
-            _P("当前IP请求异常，请更换IP地址进行访问")))
-        self.assertTrue(any("拒绝页" in m for m in logs))
+        p_ok = _P("当前IP请求异常，请更换IP地址进行访问")
+        self.assertTrue(h._detect_ip_blocked(p_ok))
+        self.assertTrue(any("命中公示系统拒绝页" in m for m in logs))
         self.assertFalse(h._detect_ip_blocked(_P("")))
         # evaluate 抛异常（页面跳转中）不能把流程打断
         class _Bad:
+            _closed = False
+
+            @property
+            def context(self):
+                return self
+
+            @property
+            def pages(self):
+                return [self]
+
+            def is_closed(self):
+                return False
+
             def evaluate(self, js, arg=None):
                 raise RuntimeError("Execution context was destroyed")
         self.assertFalse(h._detect_ip_blocked(_Bad()))
@@ -561,8 +595,23 @@ class TestGsxtIpBlock(unittest.TestCase):
         h.engine = SimpleNamespace(log=lambda *a, **k: None)
 
         class _P:
+            _closed = False
+
+            @property
+            def context(self):
+                return self
+
+            @property
+            def pages(self):
+                return [self]
+
+            def is_closed(self):
+                return False
+
             def evaluate(self, js, arg=None):
-                return "400 Bad Request"
+                if "location.href" in js and "detail" in js:
+                    return {}
+                return {"bad": True, "len": 15, "snippet": "400 Bad Request"}
 
         self.assertTrue(h._detect_ip_blocked(_P()))
 
@@ -582,6 +631,9 @@ class TestGsxtIpBlock(unittest.TestCase):
             def send(self, method, params):
                 sent.append((method, params.get("origin")))
 
+            def detach(self):
+                pass
+
         class _Ctx:
             def new_cdp_session(self, page):
                 return _CDP()
@@ -589,8 +641,18 @@ class TestGsxtIpBlock(unittest.TestCase):
             def clear_cookies(self):
                 raise AssertionError("不应该走全量清 Cookie 的兜底")
 
+            def cookies(self, urls=None):
+                # 票据回读替身：清之前有 4 张关键票据，清之后为空
+                return [{"name": "__jsl_clearance_s"}] if not sent else []
+
         class _P:
-            context = _Ctx()
+            _closed = False
+
+            def __init__(self):
+                self.context = _Ctx()
+
+            def is_closed(self):
+                return False
 
         self.assertTrue(h._clear_site_cookies(_P()))
         methods = [m for m, _ in sent]
