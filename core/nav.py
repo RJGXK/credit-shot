@@ -37,8 +37,44 @@ from core.errors import Aborted, Skipped
 
 __all__ = [
     "goto", "goto_via_landing", "ENTRY_CHAINS", "landing_for",
-    "click_matching_link", "nav_state",
+    "click_matching_link", "nav_state", "site_referer",
 ]
+
+
+#: 各站点的「上个网站」（Referer）。
+#: 为什么要统一带：瑞数/知道创宇这类 WAF 会把「无来源直达」判成异常请求。
+#: gsxt 的实测表现就是——首页能开，但点【查询】毫无反应，
+#: 刷新后提示「当前IP请求异常 / 您的IP最近有可疑的攻击行为」。
+#: 凡是程序主动 page.goto 本站页面（兜底直连、跳结果页等），一律带上这里的值。
+SITE_REFERERS = {
+    # 公示系统：上级是市场监管总局（入口链第一条落地页）
+    "gsxt": "https://www.samr.gov.cn/",
+    # 信用中国：上级是中央政府门户
+    "creditchina": "https://www.gov.cn/",
+    # 政府采购网：同站首页（从首页进监督检查，是站点自己设计的路径）
+    "ccgp": "https://www.ccgp.gov.cn/index.shtml",
+    # 住建部：上级是住建部官网
+    "mohurd": "https://www.mohurd.gov.cn/",
+    # 军队采购网：同站首页
+    "plap": "https://www.plap.mil.cn/freecms-glht/site/juncai/index.htm",
+    # 执行信息公开网：同站首页
+    "zxgk": "https://zxgk.court.gov.cn/shouye/index.html",
+    # 裁判文书网：上级是最高人民法院官网
+    "wenshu": "https://www.court.gov.cn/",
+    # 认监委：上级是认监委官网
+    "cnca": "https://www.cnca.gov.cn/",
+}
+
+
+def site_referer(site_key: str) -> str:
+    """取某站点的默认 Referer（上个网站）；没有配置就退回入口链首条落地页。"""
+    ref = SITE_REFERERS.get(site_key) or ""
+    if ref:
+        return ref
+    for step in landing_for(site_key):
+        if step.get("landing"):
+            return str(step["landing"])
+    return ""
 
 
 #: 全局可中断等待钩子。引擎启动时注册成 control.wait，
@@ -74,7 +110,11 @@ ENTRY_CHAINS = {
          "expect_host": "www.gsxt.gov.cn"},
         {"landing": "https://www.samr.gov.cn/xw/", "match": "www.gsxt.gov.cn",
          "expect_host": "www.gsxt.gov.cn"},
-        {"landing": "https://www.gsxt.gov.cn/", "match": ""},
+        # 兜底也不能裸奔：瑞数会把「无 Referer 直达首页」判成异常请求
+        # （表现：首页能开，但点【查询】毫无反应，刷新后提示 IP 异常）。
+        # 这里显式带上上级目录作为来源。
+        {"landing": "https://www.gsxt.gov.cn/", "match": "",
+         "referer": "https://www.samr.gov.cn/"},
     ],
     # 信用中国：直连返回 412，走政府门户跳转
     "creditchina": [
@@ -143,17 +183,26 @@ def _is_interrupted(exc: Exception) -> bool:
 
 
 def goto(page, url: str, timeout_ms: int = 45000,
-         wait_until: str = "domcontentloaded", log=print) -> bool:
+         wait_until: str = "domcontentloaded", log=print,
+         referer: str = "") -> bool:
     """打开 URL，容忍「站点自跳转打断」。
 
     裁判文书网、gsxt 都会在 goto 期间自己发起跳转，Playwright 会抛
     ``Navigation ... is interrupted by another navigation to ...``。
     这种情况下页面**其实已经到达了目标站**，不算失败。
 
+    referer 不为空时，给这次导航带上 ``Referer`` 头（「携带上个网站的信息」）。
+    瑞数/知道创宇这类 WAF 会把「无来源直达」判成异常请求——
+    用户实测 gsxt 就是这个表现：页面能开，但点查询毫无反应，
+    刷新后直接提示「当前IP请求异常 / 您的IP最近有可疑的攻击行为」。
+
     返回是否成功（打断也算成功）。
     """
+    kwargs = {}
+    if referer:
+        kwargs["referer"] = referer
     try:
-        page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        page.goto(url, wait_until=wait_until, timeout=timeout_ms, **kwargs)
         return True
     except Exception as exc:
         if _is_interrupted(exc):
@@ -374,10 +423,15 @@ def goto_via_landing(page, site_key: str, log=print,
         expect_host = step.get("expect_host") or ""
         match_path = step.get("match_path") or ""
         expect_path = step.get("expect_path") or ""
+        referer = step.get("referer") or ""
+        # 「直连兜底」条目（没有 match，落地页本身就是目标站）必须带 Referer，
+        # 否则等于裸奔进站，会被 WAF 记成异常来源。
+        if not referer and not match:
+            referer = site_referer(site_key)
         if not landing:
             continue
         try:
-            goto(page, landing, timeout_ms=timeout_ms, log=log)
+            goto(page, landing, timeout_ms=timeout_ms, log=log, referer=referer)
         except Exception as exc:
             log("  ⚠ 落地页打开失败(%s)：%s" % (landing[:44], str(exc).splitlines()[0][:70]))
             last = {"ok": False, "reason": str(exc)[:120]}

@@ -545,7 +545,9 @@ def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
     for url in ("https://shiming.gsxt.gov.cn/socialuser-use-login.html",
                 "https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html"):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # 带上「上个网站」（公示系统首页）：无来源直达会被瑞数判成异常
+            page.goto(url, wait_until="domcontentloaded", timeout=30000,
+                      referer="https://www.gsxt.gov.cn/index.html")
             time.sleep(3)
             if page.evaluate("()=>!!document.getElementById('UserName')"):
                 log("  ✔ 已直达 gsxt 登录页")

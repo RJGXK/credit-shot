@@ -138,7 +138,7 @@ class WenshuHandler(PlatformHandler):
         self.engine.log("  打开裁判文书网首页…")
         try:
             nav.goto(page, WS_HOME, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log)
+                     log=self.engine.log, referer=nav.site_referer("wenshu"))
         except Exception as exc:
             self.engine.log("  ✘ 首页打开失败：%s" % str(exc).splitlines()[0][:90])
             return False

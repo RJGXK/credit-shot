@@ -128,7 +128,7 @@ class MohurdHandler(PlatformHandler):
         if not res.get("ok"):
             self.engine.log("  ⚠ 上级目录跳转未成功，直接打开目标页")
             nav.goto(page, HOME_URLS["mohurd"], timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log)
+                     log=self.engine.log, referer=nav.site_referer("mohurd"))
         if res.get("page") is not None:
             page = res["page"]
         self.engine.sleep(3.0)

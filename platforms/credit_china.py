@@ -64,7 +64,7 @@ class CreditChinaHandler(PlatformHandler):
             self.engine.log("  ⚠ 上级目录跳转未成功，直接打开目标页")
         try:
             nav.goto(page, url, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log)
+                     log=self.engine.log, referer=nav.site_referer("creditchina"))
         except Exception as exc:
             self.engine.log("  ⚠ 打开目标页异常：%s" % str(exc).splitlines()[0][:80])
 

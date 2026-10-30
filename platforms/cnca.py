@@ -300,7 +300,7 @@ class CncaHandler(PlatformHandler):
         if not res.get("ok"):
             self.engine.log("  ⚠ 上级目录跳转未成功，直接打开目标页")
             nav.goto(page, HOME, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log)
+                     log=self.engine.log, referer=nav.site_referer("cnca"))
         self._page = page
 
         # ---- 首页：填企业名称 → 点【查询】→ 整页跳转 ----
@@ -347,7 +347,7 @@ class CncaHandler(PlatformHandler):
         except Exception:
             self.engine.log("  ⚠ 没等到页面跳转，直接打开综合查询页")
             nav.goto(page, RESULT_URL, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log)
+                     log=self.engine.log, referer=nav.site_referer("cnca"))
         self.engine.sleep(2.0)
 
         # ---- 结果页：必须**再填一次**企业名称（服务端没给可见输入框填值）----

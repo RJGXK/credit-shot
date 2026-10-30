@@ -62,7 +62,7 @@ class ShixinHandler(PlatformHandler):
                              timeout_ms=self.engine.timeout * 1000)
         try:
             nav.goto(page, url, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log)
+                     log=self.engine.log, referer=nav.site_referer("zxgk"))
         except Exception as exc:
             self.engine.log("  ⚠ 打开目标页异常：%s" % str(exc).splitlines()[0][:80])
         self.wait_ready(page, "()=>!!document.getElementById('myform')", timeout=30)

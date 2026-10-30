@@ -144,21 +144,10 @@ class GsxtHandler(PlatformHandler):
         所以这里改成等**搜索框 #keyword 真正可见**才算就绪。
         """
         # ---- 走上级目录跳转链 ----
-        # 注意：若当前页面停在登录子站（shiming.gsxt.gov.cn）或空白页，
-        # 先锚回首页域再走入口链，否则链上的 samr 落地判断会被旧页干扰。
-        try:
-            cur_url = page.url or ""
-        except Exception:
-            cur_url = ""
-        if "shiming.gsxt.gov.cn" in cur_url:
-            self.engine.log("  当前在登录子站，先回 gsxt 首页域")
-            try:
-                nav.goto(page, HOME_URLS["gsxt"],
-                         timeout_ms=self.engine.timeout * 1000,
-                         log=self.engine.log)
-                self.engine.sleep(2.0)
-            except Exception:
-                pass
+        # **不要裸跳**：从登录子站/空白页直接 goto gsxt 首页属于「无来源直达」，
+        # 瑞数会把这套会话判成异常（页面能开，但点【查询】毫无反应，
+        # 刷新后提示「当前IP请求异常 / 您的IP最近有可疑的攻击行为」）。
+        # 一律从市场监管总局点链接进来，导航天然带 Referer。
         chain_res = nav.goto_via_landing(page, "gsxt", log=self.engine.log,
                                          timeout_ms=self.engine.timeout * 1000)
         # 链接带 target=_blank 时会开新标签页，后续操作要切过去。
@@ -178,6 +167,27 @@ class GsxtHandler(PlatformHandler):
                 return False
             ok = self.wait_keyword(page, timeout=18)
             if ok:
+                # 校验这次进入到底有没有携带上个网站的信息（Referer）。
+                # 空来源最容易触发风控：宁可再走一次入口链，也别带着异常会话去查询。
+                ref = ""
+                try:
+                    ref = str(page.evaluate("()=>document.referrer||''"))
+                except Exception:
+                    pass
+                self.engine.log("  进入首页携带的来源：%s" % (ref[:100] or "（空）"))
+                if not ref and rnd < rounds:
+                    self.engine.log("  ⚠ 本次进入没有携带上个网站信息，容易触发风控，"
+                                    "重新从上级目录进入")
+                    try:
+                        c3 = nav.goto_via_landing(page, "gsxt", log=self.engine.log,
+                                                  timeout_ms=self.engine.timeout * 1000)
+                        if c3.get("page") is not None:
+                            self._gsxt_page = c3["page"]
+                            page = self._gsxt_page
+                    except Exception:
+                        pass
+                    self.engine.sleep(2.5)
+                    continue
                 if rnd > 1 or chain_res.get("via"):
                     self.engine.log("  gsxt 首页就绪（第 %d 次尝试）" % rnd)
                 return True
@@ -436,7 +446,7 @@ class GsxtHandler(PlatformHandler):
                 self._log_ip_blocked()
                 return
 
-            # ---- 回落：真实鼠标点击 / 回车 ----
+            # ---- 回落：真实鼠标点击 / 回车 / 站内结果页链接 ----
             self.engine.log("  ⚠ 点【查询】后没有跳转，改用真实鼠标点击再试")
             try:
                 page.locator("#btn_query").first.click(timeout=4000)
@@ -452,11 +462,40 @@ class GsxtHandler(PlatformHandler):
                 self._gsxt_ip_blocked = True
                 self._log_ip_blocked()
                 return
+            # 再兜一层：页面里如果本来就有指向结果页的链接，点它最稳
+            # （链接自带站点追加的参数，点击产生的导航还带 Referer）
+            if self._click_search_link(page):
+                if self._wait_search_reaction(page, timeout=8):
+                    reacted = True
+                    break
+                if self._detect_ip_blocked(page):
+                    self._gsxt_ip_blocked = True
+                    self._log_ip_blocked()
+                    return
 
         if not reacted:
             self.engine.log("  ⚠ 自动搜索始终没有跳转（已重试 2 轮）。"
                             "请在浏览器里手动点【查询】完成搜索；"
                             "若页面提示 IP 异常，请换 IP 或到 shiming.gsxt.gov.cn 实名登录。")
+
+    def _click_search_link(self, page) -> bool:
+        """兜底：点页面里指向结果页（corp-query-search）的链接。
+
+        比 JS 点按钮可靠：链接的 href 本身带着站点要求的全部参数，
+        点击产生的导航也天然带 Referer（「携带上个网站的信息」）。
+        """
+        try:
+            r = page.evaluate("""()=>{
+              const a=[...document.querySelectorAll('a[href]')]
+                .find(x=>/corp-query-search/.test(x.href||''));
+              if(!a) return 'NONE';
+              a.click();
+              return 'CLICK:'+(a.href||'').slice(0,90);
+            }""")
+        except Exception:
+            return False
+        self.engine.log("  兜底：点击站内结果页链接 %s" % str(r)[:100])
+        return str(r).startswith("CLICK")
 
     def _fill_keyword(self, page, company: str) -> bool:
         """把企业名称填进搜索框（原生 setter + input/change 事件）。"""

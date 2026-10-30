@@ -33,7 +33,7 @@ class CcggHandler(PlatformHandler):
                              timeout_ms=self.engine.timeout * 1000)
         try:
             nav.goto(page, home, timeout_ms=self.engine.timeout * 1000,
-                     log=self.engine.log)
+                     log=self.engine.log, referer=nav.site_referer("ccgp"))
         except Exception as exc:
             self.engine.log("  ⚠ 打开首页异常：%s" % str(exc).splitlines()[0][:80])
         self.engine.sleep(3.0)
@@ -56,8 +56,9 @@ class CcggHandler(PlatformHandler):
             pass
         if "/cr/list" in cur:
             self.engine.log("  落到 /cr/list，改用 /search/cr/ 入口")
-            page.goto(HOME_URLS["ccgp_list"], wait_until="domcontentloaded",
-                      timeout=self.engine.timeout * 1000)
+            nav.goto(page, HOME_URLS["ccgp_list"],
+                     timeout_ms=self.engine.timeout * 1000, log=self.engine.log,
+                     referer=nav.site_referer("ccgp"))
             self.engine.sleep(4.0)
 
         self.wait_ready(page, "()=>!!document.querySelector('iframe')", timeout=25)

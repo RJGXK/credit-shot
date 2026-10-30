@@ -499,5 +499,78 @@ class TestGsxtIpBlock(unittest.TestCase):
         self.assertFalse(h._detect_ip_blocked(_Bad()))
 
 
+# ============================================================ 入口链 / Referer
+class TestNavReferer(unittest.TestCase):
+    """入口链导航必须能携带上个网站的信息（Referer）。
+
+    瑞数 WAF 会把「无来源直达」判成异常请求：页面能开，但点查询毫无反应，
+    刷新后提示「当前IP请求异常 / 您的IP最近有可疑的攻击行为」。
+    """
+
+    def test_goto_passes_referer(self):
+        from core import nav
+        calls = {}
+
+        class _P:
+            def goto(self, url, **kw):
+                calls.update(url=url, **kw)
+
+        nav.goto(_P(), "https://www.gsxt.gov.cn/",
+                 referer="https://www.samr.gov.cn/")
+        self.assertEqual(calls.get("referer"), "https://www.samr.gov.cn/")
+
+    def test_goto_without_referer_omits_kwarg(self):
+        from core import nav
+        calls = {}
+
+        class _P:
+            def goto(self, url, **kw):
+                calls.update(url=url, **kw)
+
+        nav.goto(_P(), "https://www.samr.gov.cn/")
+        self.assertNotIn("referer", calls)
+
+    def test_gsxt_chain_fallback_carries_referer(self):
+        from core import nav
+        chain = nav.ENTRY_CHAINS["gsxt"]
+        self.assertTrue(any(s.get("referer") for s in chain),
+                        "gsxt 入口链的兜底直连必须带 referer")
+
+    def test_every_site_has_default_referer(self):
+        """每个站点都要有默认「上个网站」，否则裸跳必被 WAF 记异常。"""
+        from core import nav
+        for key in nav.ENTRY_CHAINS:
+            self.assertTrue(nav.site_referer(key),
+                            "%s 缺少默认 Referer" % key)
+
+    def test_direct_chain_entries_get_referer(self):
+        """入口链里「直连兜底」（无 match）必须能拿到 Referer。"""
+        from core import nav
+        for key, chain in nav.ENTRY_CHAINS.items():
+            for step in chain:
+                if not step.get("match"):
+                    ref = step.get("referer") or nav.site_referer(key)
+                    self.assertTrue(ref, "%s 的直连兜底没有 Referer" % key)
+
+    def test_platform_gotos_carry_referer(self):
+        """所有平台的直连导航都必须带 referer=（用户要求：所有网站都携带）。"""
+        import glob
+        plat_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "platforms")
+        missing = []
+        for path in sorted(glob.glob(os.path.join(plat_dir, "*.py"))):
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            for i, line in enumerate(lines):
+                s = line.strip()
+                if s.startswith("#"):
+                    continue
+                if "nav.goto(" in s or "page.goto(" in s:
+                    window = " ".join(lines[i:i + 4])
+                    if "referer=" not in window:
+                        missing.append("%s:%d" % (os.path.basename(path), i + 1))
+        self.assertFalse(missing, "这些直连没带 Referer：%s" % missing)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
