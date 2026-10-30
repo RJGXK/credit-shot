@@ -89,7 +89,12 @@ class FileLogger:
             pass
 
     def _open(self, day: str) -> None:
-        """打开（或切换到）当天的日志文件，写文件头。"""
+        """打开（或切换到）当天的日志文件，写文件头。
+
+        文件头规则：当天**第一次**写时写大头部；同一天里**每次新会话**（软件重启）
+        都补一行「新会话 + 当前版本」——之前只在文件头写一次版本，用户升级后
+        当天日志头还是旧版本号（如 2.1.3），回查时完全被误导。
+        """
         try:
             if self._fh is not None:
                 try:
@@ -107,6 +112,11 @@ class FileLogger:
                                % time.strftime("%Y-%m-%d %H:%M:%S"))
                 self._fh.write("程序版本：%s\n" % _app_version())
                 self._fh.write("=" * 60 + "\n")
+            else:
+                self._fh.write("─" * 60 + "\n")
+                self._fh.write("── 新会话开始  %s  程序版本：%s\n"
+                               % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                  _app_version()))
         except Exception:
             self._fh = None
 

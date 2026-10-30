@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 
 from core.errors import EngineError
@@ -80,29 +81,64 @@ class GsxtHandler(PlatformHandler):
                 return []
 
         def _click_one(kw):
+            # 关键（v2.2.7）：小分项也要用**真实鼠标点击**。v2.2.4 已实锤
+            # 「人点就灵、软件合成 .click() 被吞」，入口和登录都是这个根因，
+            # 侧边栏小分项同理——只展开不点开就看不到具体详情（用户反馈第 2 点）。
+            js = """
+            (kw)=>{
+              const W=window.innerWidth;
+              const norm=s=>(s||'').replace(/\\s+/g,'').trim();
+              const t=[...document.querySelectorAll('div,span,h1,h2,h3,p,a,label')]
+                .find(e=>norm(e.innerText||e.textContent||'')==='目录导航');
+              if(!t) return '';
+              let root=t;
+              for(let i=0;i<7 && root.parentElement;i++){root=root.parentElement;
+                if(root.querySelectorAll('a,li,span,div').length>=8) break;}
+              const els=[...root.querySelectorAll('a,span,div,li,em,i,label')]
+                .filter(e=>{const r=e.getBoundingClientRect();
+                  return r.width>0&&r.height>0&&r.x<W*0.35&&
+                    norm(e.innerText||e.textContent||'')===kw;});
+              if(!els.length) return '';
+              els.sort((a,b)=>norm(a.innerText||a.textContent||'').length
+                              -norm(b.innerText||b.textContent||'').length);
+              const e=els[0];
+              e.scrollIntoView({block:'center'});
+              const b=e.getBoundingClientRect();
+              return JSON.stringify({cx:b.left+b.width/2, cy:b.top+b.height/2,
+                                     tag:e.tagName});
+            }"""
             try:
-                return page.evaluate("""(kw)=>{
-                  const W=window.innerWidth;
-                  const norm=s=>(s||'').replace(/\\s+/g,'').trim();
-                  const t=[...document.querySelectorAll('div,span,h1,h2,h3,p,a,label')]
-                    .find(e=>norm(e.innerText||e.textContent||'')==='目录导航');
-                  if(!t) return 'NONE';
-                  let root=t;
-                  for(let i=0;i<7 && root.parentElement;i++){root=root.parentElement;
-                    if(root.querySelectorAll('a,li,span,div').length>=8) break;}
-                  const els=[...root.querySelectorAll('a,span,div,li,em,i,label')]
-                    .filter(e=>{const r=e.getBoundingClientRect();
-                      return r.width>0&&r.height>0&&r.x<W*0.35&&
-                        norm(e.innerText||e.textContent||'')===kw;});
-                  if(!els.length) return 'NONE';
-                  els.sort((a,b)=>norm(a.innerText||a.textContent||'').length
-                                  -norm(b.innerText||b.textContent||'').length);
-                  els[0].scrollIntoView({block:'center'});
-                  els[0].click();
-                  return 'CLICK:'+kw;
-                }""", kw)
+                r = page.evaluate(js, kw)
+                data = json.loads(r) if isinstance(r, str) and r.startswith("{") else None
             except Exception as exc:
+                data = None
                 return "ERR:%s" % str(exc).splitlines()[0][:40]
+            if not data:
+                return ""
+            try:
+                page.mouse.click(data["cx"], data["cy"])
+                return "CLICK:" + kw
+            except Exception:
+                # 真实点击失败（元素被遮挡等）才回落合成点击
+                try:
+                    page.evaluate("""(kw)=>{
+                      const W=window.innerWidth;
+                      const norm=s=>(s||'').replace(/\\s+/g,'').trim();
+                      const t=[...document.querySelectorAll('div,span,h1,h2,h3,p,a,label')]
+                        .find(e=>norm(e.innerText||e.textContent||'')==='目录导航');
+                      if(!t) return;
+                      let root=t;
+                      for(let i=0;i<7 && root.parentElement;i++){root=root.parentElement;
+                        if(root.querySelectorAll('a,li,span,div').length>=8) break;}
+                      const els=[...root.querySelectorAll('a,span,div,li,em,i,label')]
+                        .filter(e=>{const r2=e.getBoundingClientRect();
+                          return r2.width>0&&r2.height>0&&r2.x<W*0.35&&
+                            norm(e.innerText||e.textContent||'')===kw;});
+                      if(els.length) els[0].click();
+                    }""", kw)
+                    return "CLICK:" + kw
+                except Exception as exc:
+                    return "ERR:%s" % str(exc).splitlines()[0][:40]
 
         seen = set()
         clicked = 0
@@ -260,6 +296,11 @@ class GsxtHandler(PlatformHandler):
         page = self._gsxt_page or page
         cleared_once = False
         for rnd in range(1, rounds + 1):
+            # 浏览器被用户关掉了 → 立即止损，别再重试（否则一秒刷五条
+            # 「Target page has been closed」，用户日志 14:03:25 就是它）
+            if self._browser_dead():
+                self.engine.log("  ✘ 浏览器已被关闭，停止导航重试")
+                return False
             # IP 被风控时首页根本出不来（点查询也只会毫无反应）：
             # 必须立刻停手，反复重走入口链只会被判得更死。
             if self._detect_ip_blocked(page):
@@ -291,6 +332,10 @@ class GsxtHandler(PlatformHandler):
                     continue
                 if rnd > 1 or chain_res.get("via"):
                     self.engine.log("  gsxt 首页就绪（第 %d 次尝试）" % rnd)
+                # 就绪后把多余的旧标签页清掉（搜索页/上次残留），
+                # 用户反馈「页面打开太多，不知道软件在操作哪个」——
+                # 之后浏览器里只剩这一个工作页，人工配合时看它就对了。
+                self._close_extra_tabs(page)
                 return True
             if self._detect_ip_blocked(page):
                 self._gsxt_ip_blocked = True
@@ -318,13 +363,23 @@ class GsxtHandler(PlatformHandler):
                 self.engine.sleep(1.5)
                 # 不 continue：让下面的「重走入口链」分支把页面重新带起来
             if rnd < rounds:
+                if self._browser_dead():
+                    self.engine.log("  ✘ 浏览器已被关闭，停止导航重试")
+                    return False
                 self.engine.log("  gsxt 首页未就绪，重新通过上级目录跳转进入（第 %d 次）" % (rnd + 1))
+                old_page = page
                 try:
                     c2 = nav.goto_via_landing(page, "gsxt", log=self.engine.log,
                                               timeout_ms=self.engine.timeout * 1000)
                     if c2.get("page") is not None:
                         self._gsxt_page = c2["page"]
                         page = self._gsxt_page
+                        # 新工作页到手就关掉上一轮的旧 gsxt 标签页，防止越积越多
+                        if page is not old_page:
+                            try:
+                                old_page.close()
+                            except Exception:
+                                pass
                 except Exception as exc:
                     self.engine.log("  gsxt 重新跳转异常(第%d次)：%s"
                              % (rnd, str(exc).splitlines()[0][:60]))
@@ -509,6 +564,58 @@ class GsxtHandler(PlatformHandler):
                 continue
         return None
 
+    def _browser_dead(self) -> bool:
+        """整个浏览器上下文是否已不可用（用户手动关了浏览器窗口等）。
+
+        返回 True 时调用方必须立即止损——再重试只会刷屏
+        「Target page, context or browser has been closed」。
+        """
+        try:
+            ctx = self.engine.ctx
+            if ctx is None:
+                return True
+            _ = list(ctx.pages)
+            return False
+        except Exception:
+            return True
+
+    def _close_extra_tabs(self, keep, log_prefix: str = "  清理多余标签页") -> int:
+        """关掉除 keep 以外的所有标签页（用户反馈「页面打开太多，不知道在操作哪个」）。
+
+        只保留 keep 和 about:blank 之外的同上下文页面；返回关闭个数。纯防御：
+        任何一步失败都不抛。
+        """
+        closed = 0
+        try:
+            if keep is None or keep.is_closed():
+                return 0
+            ctx = keep.context
+            for p in list(ctx.pages):
+                if p is keep:
+                    continue
+                try:
+                    if p.is_closed():
+                        continue
+                    u = p.url or ""
+                    if u == "about:blank":
+                        p.close()
+                        closed += 1
+                        continue
+                    p.close()
+                    closed += 1
+                except Exception:
+                    continue
+            if closed:
+                self.engine.log("%s：已关闭 %d 个旧标签页，当前只保留 gsxt 工作页"
+                                % (log_prefix, closed))
+            try:
+                keep.bring_to_front()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return closed
+
     def _gsxt_is_logged_in(self, page) -> bool:
         """首页上是否已处于登录态：出现「退出登录/个人中心/欢迎您」等字样即视为已登录。
 
@@ -678,7 +785,9 @@ class GsxtHandler(PlatformHandler):
                     self._wait_search_reaction(page, timeout=8)
 
             self.engine.wait_manual(
-                "gsxt 已搜索「%s」：\n"
+                "gsxt 已搜索「%s」\n"
+                "（程序只在标题为「国家企业信用信息公示系统」的那个标签页里操作，"
+                "多余的旧标签页已自动关闭）：\n"
                 "① 请在浏览器里完成验证码/滑块（极验弹窗可能出现在页面中央或独立浮层，"
                 "需要手动拖动/点选）；\n"
                 "② 验证通过后会出现企业列表，点目标企业进入详情页"
@@ -690,6 +799,10 @@ class GsxtHandler(PlatformHandler):
                 pages = list(page.context.pages)
             except Exception:
                 pages = [page]
+            # 用户可能在等待期间关了浏览器
+            if self._browser_dead():
+                self.engine.log("  ✘ 浏览器已被关闭，停止等待详情页")
+                return False
 
             # 平台自己跳出了登录页 → 这时才登录，登录后重新搜索
             login_page = self._find_login_page(pages)
@@ -721,6 +834,9 @@ class GsxtHandler(PlatformHandler):
                 except Exception:
                     pass
                 self.engine.log("  ✔ 已进入企业详情页：%s" % (detail.url or "")[:90])
+                # 关掉搜索页/搜索引擎页等残留标签：之后人工配合和整页截图
+                # 都只在详情页这一个标签上进行（用户反馈「不知道在操作哪个」）
+                self._close_extra_tabs(detail, log_prefix="  清理多余标签页")
                 return True
             self.engine.log("  ⚠ 还没找到企业详情页（第 %d 次），请确认已点击目标企业" % round_no)
         self.engine.log("  ⚠ 未能进入企业详情页，按当前页面截图")
@@ -742,6 +858,10 @@ class GsxtHandler(PlatformHandler):
             不再一上来就强制登录（登录是整条链路最不稳的一环）。
         """
         for attempt in range(1, 3):
+            # 浏览器被关掉：立即止损（重试只会刷屏 Target page has been closed）
+            if self._browser_dead():
+                self.engine.log("  ✘ 浏览器已被关闭，停止搜索重试")
+                return "none"
             # 查询前先看是不是已经被风控（此时点按钮不会跳转，重试只会更糟）
             if self._detect_ip_blocked(page):
                 self._gsxt_ip_blocked = True

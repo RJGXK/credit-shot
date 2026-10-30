@@ -207,15 +207,30 @@ class _FakePage:
         # gsxt 登录判定会用 page.url 判断「是否已跳回首页」；
         # 默认给登录子站 URL，让替身行为贴近真实站点
         self.url = "https://shiming.gsxt.gov.cn/socialuser-use-rllogin.html"
+        # v2.2.5 起 gsxt 填值走「真实键盘逐字符输入」，需要这两个替身
+        self.keyboard = _FakeKeyboard(self)
 
     def evaluate(self, js, arg=None):
         if "document.body" in js:
             return self.text
-        # gsxt 填值脚本（一次填 UserName + gsxtp）
+        # gsxt 填值脚本（旧版一次填 UserName + gsxtp）
         if "set('UserName'" in js:
             frame = self.frames[0]
             frame.filled.append(arg)
             return "OK/OK"
+        # 新版逐字符输入：单字段整串 setter 兜底 / 回读
+        if "HTMLInputElement.prototype" in js and isinstance(arg, (list, tuple)) \
+                and len(arg) == 2 and isinstance(arg[0], str) and arg[0].startswith("#"):
+            sel, v = arg
+            frame = self.frames[0]
+            frame.filled.append({"sel": sel, "v": v})
+            self._typed = getattr(self, "_typed", {})
+            self._typed[sel] = v
+            return True
+        # 回读：返回对应字段「已敲入」的值
+        if isinstance(arg, str) and arg.startswith("#"):
+            typed = getattr(self, "_typed", {})
+            return typed.get(arg, "")
         # gsxt 打开登录脚本：替身模拟「已在登录页」
         if "ALREADY" in js:
             return "ALREADY"
@@ -224,6 +239,44 @@ class _FakePage:
     def wait_for_function(self, js, arg=None, timeout=None):
         # 与 evaluate 同义（js_action 先试这个）；替身直接落 evaluate
         return self.evaluate(js, arg)
+
+    def wait_for_selector(self, selector, timeout=None):
+        # 替身：永远「找到了」输入框（真实元素无需操作，只记录选中）
+        return _FakeLocator(self, selector)
+
+
+class _FakeLocator:
+    """wait_for_selector 的返回替身：支持 .click()（聚焦输入框用真实鼠标点击）。"""
+
+    def __init__(self, page, selector):
+        self._page = page
+        self._selector = selector
+
+    def click(self, timeout=None):
+        return True
+
+
+class _FakeKeyboard:
+    """模拟真实键盘：逐字符 type 记进 page._typed；Ctrl+A/Delete/Tab 空操作。"""
+
+    def __init__(self, page):
+        self._page = page
+
+    def type(self, text, delay=0):
+        typed = getattr(self._page, "_typed", None)
+        if typed is None:
+            typed = {}
+            self._page._typed = typed
+        last_sel = getattr(self._page, "_active_sel", "#UserName")
+        typed[last_sel] = typed.get(last_sel, "") + text
+        return None
+
+    def press(self, key):
+        if key == "Tab":
+            # Tab 切到下一个字段：UserName -> gsxtp（贴近真实登录页顺序）
+            self._page._active_sel = "#gsxtp"
+        # Control+A / Delete 等：真实场景是清空，替身里无需处理
+        return None
 
 
 class _Clock:
@@ -331,10 +384,10 @@ class TestAutoLogin(unittest.TestCase):
         res = autologin.try_login(page, "gsxt", "13800138000", "pw", print)
         self.assertTrue(res.ok, res.reason)
         self.assertTrue(res.filled)
-        # gsxt 一次 evaluate 同时填账号 + 密码
-        self.assertEqual(len(frame.filled), 1)
-        self.assertEqual(frame.filled[0]["u"], "13800138000")
-        self.assertEqual(frame.filled[0]["p"], "pw")
+        # gsxt 逐字符键盘输入：验证两个字段都「敲」对了值
+        typed = getattr(page, "_typed", {})
+        self.assertEqual(typed.get("#UserName", ""), "13800138000")
+        self.assertEqual(typed.get("#gsxtp", ""), "pw")
 
     def test_no_password_in_log(self):
         """日志里绝不能出现密码原文。"""

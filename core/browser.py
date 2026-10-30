@@ -187,7 +187,20 @@ class BrowserSession:
             try:
                 return self.connect_cdp(reuse_port)
             except Exception as exc:
-                self.log("  ⚠ 复用失败（%s），改为重新启动浏览器" % str(exc).splitlines()[0])
+                # 10:57 日志实锤：旧实例刚被杀、新实例还没起来时，
+                # 复用会报 connect ECONNREFUSED。这里清场后**重启**而不是直接崩。
+                self.log("  ⚠ 复用失败（%s），清理旧实例后重新启动浏览器"
+                         % str(exc).splitlines()[0][:60])
+                try:
+                    if self.pw is not None:
+                        self.pw.stop()
+                except Exception:
+                    pass
+                self.pw = None
+                self.browser_obj = None
+                self.ctx = None
+                self.kill_stale_browsers(profile)
+                time.sleep(2.0)
 
         # 2) 重新启动
         port = self.free_port()
@@ -248,7 +261,22 @@ class BrowserSession:
                 f.write(str(port))
         except Exception:
             pass
-        return self.connect_cdp(port)
+        try:
+            return self.connect_cdp(port)
+        except Exception as exc:
+            # 刚探测就绪仍可能接管失败（浏览器还在初始化）：歇一下再试一次
+            self.log("  ⚠ 接管刚启动的浏览器失败（%s），2 秒后重试"
+                     % str(exc).splitlines()[0][:60])
+            try:
+                if self.pw is not None:
+                    self.pw.stop()
+            except Exception:
+                pass
+            self.pw = None
+            self.browser_obj = None
+            self.ctx = None
+            time.sleep(2.0)
+            return self.connect_cdp(port)
 
 
     @staticmethod
