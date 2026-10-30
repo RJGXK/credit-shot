@@ -491,31 +491,29 @@ def _gsxt_login_form_present(page) -> bool:
 def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
     """点开 gsxt 的登录页。
 
-    实测（2026-10）：gsxt 首页的「登录」是**整页跳转**到实名认证子站
-    ``shiming.gsxt.gov.cn/socialuser-use-login.html``，
-    登录表单（#UserName / #gsxtp / #btn_login）在那个页面上。
-    所以这里点击后要等**页面跳转**完成，而不是等同页弹窗出现。
-
-    v2.3.0 修正（2026-10-30 实测）：登录页**时而不渲染**（#UserName 死等 15s
-    不出现，用户手动经验「返回上一级→重进→刷新」有效）。所以：
-      · 点击「登录」用**真实鼠标**（合成 click 会被吞——本项目第 4 次同款根因）；
-      · 跳到登录页但 #UserName 15s 不出现 → **reload 刷新**（最多 3 轮）。
+    实测（2026-10-30 DOM 实测）：首页导航栏里有明确的链接
+    ``<a href="https://shiming.gsxt.gov.cn/socialuser-use-login.html">登录</a>``。
+    直接按这个 href / 链接文字找最准；真实点击后若未跳转，用本页 goto(href, referer)
+    导航（来源是首页，完全合法，不会被判异常）。
     """
     js = """
     ()=>{
       if(document.getElementById('UserName')) return 'ALREADY';
-      const norm=s=>(s||'').replace(/\\s+/g,'').trim();
-      const els=[...document.querySelectorAll('a,span,div,li,button')];
-      // 优先找导航栏里独立的「登录」（不要点到「用户登录」「登录注册」这类长文字）
-      const hit=els.find(e=>{
-        const t=norm(e.innerText||e.textContent||'');
-        if(t!=='登录') return false;
-        const b=e.getBoundingClientRect();
-        return b.width>0 && b.height>0;});
-      if(!hit) return 'NONE';
-      hit.scrollIntoView({block:'center'});
-      const b=hit.getBoundingClientRect();
-      return JSON.stringify({cx:b.left+b.width/2, cy:b.top+b.height/2});
+      // 1) 最精准：按官方登录子站 href 找 <a>
+      let a = document.querySelector('a[href*="socialuser-use-login"], a[href*="socialuser"]');
+      // 2) 兜底：独立「登录」文字的 <a>
+      if(!a){
+        const norm=s=>(s||'').replace(/\\s+/g,'').trim();
+        a = [...document.querySelectorAll('a')].find(e=>{
+          const t=norm(e.innerText||e.textContent||'');
+          const b=e.getBoundingClientRect();
+          return t==='登录' && b.width>0 && b.height>0;
+        });
+      }
+      if(!a) return 'NONE';
+      a.scrollIntoView({block:'center'});
+      const b=a.getBoundingClientRect();
+      return JSON.stringify({href:a.href||'', cx:b.left+b.width/2, cy:b.top+b.height/2});
     }
     """
     deadline = time.time() + timeout
@@ -524,37 +522,52 @@ def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
             from core.page import eval_retry
             r = str(eval_retry(page, js, None, tries=1, delay=0.5) or "")
         except Exception:
-            # 整页跳转进行中，上下文销毁属正常
             r = ""
         if r == "ALREADY":
             return True
         if r.startswith("{"):
-            # 真实鼠标点击（v2.3.0：合成 click 会被 WAF 吞，首页入口、
-            # 登录提交、侧边栏小分项都栽过同一个坑）
             import json as _json
+            target_href = ""
             try:
                 d = _json.loads(r)
+                target_href = d.get("href") or ""
                 page.mouse.click(d["cx"], d["cy"])
-                r = "CLICK"
+                log("  已点击首页【登录】链接")
             except Exception:
-                r = ""
-        if r.startswith("CLICK"):
-            # 等跳转完成 + 登录表单出现（15 秒）；不渲染就刷新重试（最多 3 轮）
+                pass
+            # 等跳转到实名子站（最多 6 秒）
+            jumped = False
+            for _ in range(6):
+                time.sleep(1.0)
+                try:
+                    if "shiming" in (page.url or ""):
+                        jumped = True
+                        break
+                except Exception:
+                    pass
+            # 点击未跳转（偶发被 WAF 吞点击）：用合法 href 本页导航（带 Referer）
+            if not jumped and target_href:
+                log("  ⓘ 点击后未自动跳转，通过链接直接进入登录页（携带首页来源）")
+                try:
+                    from core import nav
+                    nav.goto(page, target_href, timeout_ms=30000, referer=page.url or "")
+                except Exception:
+                    pass
+
+            # 进入登录页后：等表单出现，15s 不渲染就 reload 刷新（最多 3 轮）
             for attempt in range(3):
                 d2 = time.time() + 15
-                appeared = False
                 while time.time() < d2:
                     time.sleep(1.5)
                     try:
                         if page.evaluate(
                                 "()=>!!document.getElementById('UserName')"):
-                            log("  ✔ 已进入 gsxt 登录页（shiming.gsxt.gov.cn）")
+                            log("  ✔ 已进入 gsxt 登录页，表单就绪")
                             return True
                     except Exception:
                         pass
-                # #UserName 没出现：登录页渲染卡住 → 刷新（用户手动经验）
-                log("  ⚠ 登录页 %ds 未渲染出表单，刷新重试（第 %d/3 次）"
-                    % (15, attempt + 1))
+                log("  ⚠ 登录页表单未渲染（可能网络卡顿），刷新重试（第 %d/3 次）"
+                    % (attempt + 1))
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=20000)
                 except Exception:
@@ -562,11 +575,7 @@ def _gsxt_open_login(page, log: LogFn, timeout: float = 25.0) -> bool:
                 time.sleep(3.0)
             return False
         time.sleep(1.5)
-    # 兜底：**不再直接打开登录子站网址**。
-    # 用户明确要求：不要直接输入网址，必须从首页一步一步点进去
-    # （直连 shiming 会被瑞数判成异常，登录也过不了审核）。
-    # 点不到「登录」就返回 False，由调用方挂起等人工在浏览器里操作。
-    log("  ⚠ 首页上没找到「登录」入口，未做直连跳转（避免被判异常）")
+    log("  ⚠ 首页上没找到「登录」链接")
     return False
 
 

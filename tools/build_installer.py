@@ -22,7 +22,7 @@ NSIS_CANDIDATES = [
     r"C:\Program Files (x86)\NSIS\makensis.exe",
     r"C:\Program Files\NSIS\makensis.exe",
 ]
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 
 def find_makensis() -> str:

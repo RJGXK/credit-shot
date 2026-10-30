@@ -742,27 +742,53 @@ class GsxtHandler(PlatformHandler):
             return False
 
     def _after_login_enter(self, page):
-        """登录后重新进入首页搜索框（登录成功会整页跳回首页）。
+        """登录后停留在首页搜索框（登录成功站点本身就会跳回首页）。
 
-        v2.3.0：登录跳回首页后**补一次刷新**——登录跳转链很长
-        （shiming → gsxt），落地页偶尔渲染不全（#keyword 不出现），
-        刷新一次即可恢复（用户手动经验实锤）。
+        ★ 关键修正（v2.3.1，20:14 日志实锤致命死穴）：
+          旧代码在检测到登录成功后，竟然又去调 open_portal 重走入口链（又跑去
+          Bing 搜一圈再点进站！）——这不仅开了新标签页、甚至冲掉了刚登录好的会话，
+          导致后续搜索时又变成了未登录状态被吞！
+          实测站点行为：登录成功后，当前页本身就会自动重定向跳回 gsxt 首页。
+          这里**绝不再重走入口链**，只做两件事：
+            1) 若当前还在 shiming，等它跳回；5 秒没跳就本页 goto 首页（带 referer）；
+            2) 等搜索框可见，未就绪就本页刷新一次。
+          全程留在当前已登录的标签页上！
         """
         try:
             lp = self._live_page(page) or page
-            self.open_portal(lp)
-            hp = getattr(self, "_gsxt_page", None) or lp
-            # 若搜索框没就绪，刷新一次再等（登录跳转链的落地页偶尔渲染不全）
-            if not self.wait_keyword(hp, timeout=12):
-                self.engine.log("  ⓘ 登录落地页未就绪，刷新一次再等")
+            self.engine.log("  登录成功，留在当前已登录页面等待首页就绪…")
+            cur_url = str(lp.url or "")
+            # 若还在实名子站，等它自己跳回首页（最多 8 秒）
+            if "shiming" in cur_url:
+                for _ in range(8):
+                    self.engine.sleep(1.0)
+                    try:
+                        cur_url = str(lp.url or "")
+                        if "shiming" not in cur_url and "gsxt.gov.cn" in cur_url:
+                            break
+                    except Exception:
+                        pass
+                # 还没跳回：本页直接跳首页（来源就是实名子站，完全合法）
+                if "shiming" in cur_url:
+                    self.engine.log("  ⓘ 登录页未自动跳转，本页导航到首页")
+                    try:
+                        nav.goto(lp, "https://www.gsxt.gov.cn/index.html",
+                                 timeout_ms=30000, referer=cur_url)
+                    except Exception:
+                        pass
+            # 确认搜索框就绪
+            if not self.wait_keyword(lp, timeout=12):
+                self.engine.log("  ⓘ 首页搜索框未就绪，刷新一次")
                 try:
-                    hp.reload(wait_until="domcontentloaded", timeout=20000)
+                    lp.reload(wait_until="domcontentloaded", timeout=20000)
                 except Exception:
                     pass
-                self.wait_keyword(hp, timeout=15)
-            return hp
+                self.wait_keyword(lp, timeout=15)
+            self._gsxt_page = lp
+            self.engine.log("  ✔ 已停留在登录后的公示系统首页，准备搜索")
+            return lp
         except Exception as exc:
-            self.engine.log("  ⚠ 登录后重新进入首页失败：%s"
+            self.engine.log("  ⚠ 登录后确认首页异常：%s"
                             % str(exc).splitlines()[0][:60])
             return page
 
