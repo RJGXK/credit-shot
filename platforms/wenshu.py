@@ -306,9 +306,9 @@ class WenshuHandler(PlatformHandler):
         person = bool(subj and subj.mode == MODE_PERSON)
         tag = subj.label() if subj else company
 
-        # 人员模式：诉讼与仲裁共享一次「身份证号」检索，
-        # 之后各自在结果页用全文细化（用户要求：搜索出来后全文再搜索诉讼、仲裁）
-        if person and all(s.get("ws_flow") == "party" for s in gsteps):
+        # 人员模式：行贿 / 诉讼 / 仲裁 每一项都**单独**使用「姓名 + 身份证号」检索
+        # （含 行贿：原本走全文流程只用姓名，这里统一为 当事人=姓名 + 全文=身份证号 + 再搜 行贿）
+        if person:
             self.collect_person_group(page, company, gsteps, results, shots, tag)
             return
 
@@ -339,7 +339,12 @@ class WenshuHandler(PlatformHandler):
 
     def collect_person_group(self, page, company: str, gsteps: list,
                           results: List[StepResult], shots: List[str], tag: str) -> None:
-        """人员模式：一次「当事人=姓名 + 全文=身份证号」检索，随后逐个案件类型细化。"""
+        """人员模式：行贿 / 诉讼 / 仲裁 每一项都**单独**使用「姓名 + 身份证号」检索。
+
+        用户要求：人员查询时，行贿、诉讼、仲裁分别单独用「姓名 + 身份证号码」检索。
+        所以这里**不共享**一次检索，而是每个采集项各自：
+            高级检索 → 当事人=姓名 + 全文=身份证号 → 结果页再全文细搜 案件类型
+        """
         subj = self.subject
         name = (subj.person if subj else "").strip()
         idcard = (subj.idcard if subj else "").strip()
@@ -349,7 +354,6 @@ class WenshuHandler(PlatformHandler):
                                           False, message="人员模式下没有填人员姓名"))
             return
 
-        searched = False
         for si, step in enumerate(gsteps):
             t0 = time.time()
             try:
@@ -358,17 +362,16 @@ class WenshuHandler(PlatformHandler):
                     self.engine.pace("（下一采集项前）")
                 self.engine.check_stop()
                 self.engine.log("[%s] %s" % (step["no"], step["title"]))
-                if not searched:
-                    self.engine.log("  当事人「%s」+ 全文「%s」" % (name, idcard or "-"))
-                    self.do_search(page, {"当事人": name, "全文检索": idcard},
-                                       {"当事人": "#s17", "全文检索": "#qbValue"})
-                    searched = True
-                self.engine.log("  结果页用全文搜索「%s」" % step.get("case", ""))
+                # 每一项都单独用「姓名 + 身份证号」检索
+                self.engine.log("  当事人「%s」+ 全文「%s」" % (name, idcard or "-"))
+                self.do_search(page, {"当事人": name, "全文检索": idcard},
+                                   {"当事人": "#s17", "全文检索": "#qbValue"})
+                self.engine.log("  结果页用全文搜索「%s」" % (step.get("case") or ""))
                 self.refine_by_fulltext(page, step.get("case", ""), party=name)
                 self.engine.sleep(4)
                 st = self.wait_ready(page, timeout=20)
                 self.log_state(page, st)
-                path = self.engine.shot_step(page, company, step)
+                path = self._shot(page, company, step)
                 shots.append(path)
                 results.append(StepResult(step["no"], step["key"], step["title"], tag,
                                           True, path=path, elapsed=time.time() - t0))
@@ -382,6 +385,55 @@ class WenshuHandler(PlatformHandler):
                 self.engine.log("  ✘ 本步失败：%s" % exc)
                 results.append(StepResult(step["no"], step["key"], step["title"], tag,
                                           False, message=str(exc)[:200]))
+
+    def _mask_phones(self, page) -> None:
+        """裁判文书网登录后会显示手机号，截图前把正文里的手机号临时打码。
+
+        用 window 全局暂存被改写的文本节点，截图后由 _unmask_phones 还原。
+        """
+        try:
+            page.evaluate("""()=>{
+              if(window.__csPhoneSaved__) return;   // 已经打码，避免重复
+              const PH=/1[3-9]\\d{9}/g;
+              const saved=[];
+              const walk=(root)=>{
+                for(const n of Array.from(root.childNodes)){
+                  if(n.nodeType===3){
+                    const t=n.nodeValue||'';
+                    if(/1[3-9]\\d{9}/.test(t)){
+                      saved.push({n:n, old:t});
+                      n.nodeValue=t.replace(/1[3-9]\\d{9}/g, m=>m.slice(0,3)+'****'+m.slice(7));
+                    }
+                  } else if(n.nodeType===1 &&
+                            !/^(SCRIPT|STYLE|INPUT|TEXTAREA)$/i.test(n.tagName)){
+                    walk(n);
+                  }
+                }
+              };
+              walk(document.body);
+              window.__csPhoneSaved__=saved;
+            }""")
+        except Exception:
+            pass
+
+    def _unmask_phones(self, page) -> None:
+        try:
+            page.evaluate("""()=>{
+              const saved=window.__csPhoneSaved__;
+              if(!saved) return;
+              for(const s of saved){ try{ s.n.nodeValue=s.old; }catch(e){} }
+              window.__csPhoneSaved__=null;
+            }""")
+        except Exception:
+            pass
+
+    def _shot(self, page, company: str, step: dict) -> str:
+        """截图前给手机号打码，截完还原。"""
+        self._mask_phones(page)
+        try:
+            return self.engine.shot_step(page, company, step)
+        finally:
+            self._unmask_phones(page)
 
     def run_step(self, page, company: str, step: dict, person: bool) -> list:
         """执行一个裁判文书网采集项，返回生成的截图路径列表。
@@ -406,7 +458,7 @@ class WenshuHandler(PlatformHandler):
             self.engine.sleep(4)
             st = self.wait_ready(page, timeout=20)
             self.log_state(page, st)
-            paths.append(self.engine.shot_step(page, company, step))
+            paths.append(self._shot(page, company, step))
             return paths
 
         # ---- 单位：当事人 = 单位完整名称，全文 = 案件类型 ----
@@ -418,7 +470,7 @@ class WenshuHandler(PlatformHandler):
                            {"当事人": "#s17", "全文检索": "#qbValue"})
         st = self.wait_ready(page, timeout=20)
         self.log_state(page, st)
-        paths.append(self.engine.shot_step(page, company, step))
+        paths.append(self._shot(page, company, step))
 
         # 曾用名：结果里出现就分别再查一次
         aliases = self.read_alias_names(page)
@@ -434,7 +486,7 @@ class WenshuHandler(PlatformHandler):
                     self.wait_ready(page, timeout=20)
                     sub = dict(step)
                     sub["short"] = "%s(曾用名%s)" % (step["short"], safe_name(alias))
-                    paths.append(self.engine.shot_step(page, company, sub))
+                    paths.append(self._shot(page, company, sub))
                 except Aborted:
                     raise
                 except Exception as exc:

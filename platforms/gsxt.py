@@ -230,24 +230,71 @@ class GsxtHandler(PlatformHandler):
         return bool(self.engine.auto_login(page, "gsxt", "国家企业信用信息公示系统"))
 
     def enter_detail(self, page, company: str) -> bool:
-        """gsxt 首页搜索 → 人工过滑块并选中企业 → 进入企业详情页。
+        """gsxt：先免登录搜索企业 → 人工过极验并点选企业 → 切到详情新标签页。
 
-        滑块与「在列表里选中目标企业」这一步必须人工完成（工具挂起等待）。
-        返回是否已成功进入详情页（详情页左侧有「目录导航」，标题区有「基础信息」）。
+        实测流程（2026-10-29）：
+          index 页 #keyword 填名称 → #btn_query → 弹极验 → 列表页
+          → 点企业**开新标签页**，先是「Environment Checking」白页，
+            约 3 秒后自动变成详情页（含「目录导航」「基础信息」）。
+          全程不需要登录。所以**不主动登录**；只有平台自己跳出登录页时才登录，
+          登录完成后重新搜索一次。
+
+        Environment Checking 是瑞数挑战页，**只能等，不能刷新**
+        （刷新会重新挑战，用户实测「刷新等 5 秒也还是白页」）。
         """
         if getattr(self, "_gsxt_in_detail", False):
             return True
         self.open_portal(page)
-        # 上级目录跳转可能开了新标签页，后续操作要切到那个页面
         page = getattr(self, "_gsxt_page", None) or page
-        # 配了账号密码就先自动登录（登录框在主页面里）
-        self.try_auto_login(page)
-        # 登录/跳转后页面可能已变化，重新定位实际生效的 gsxt 页面
-        cur = self._locate_active_page(page)
-        if cur is not None:
-            page = cur
-            if cur is not getattr(self, "_gsxt_page", None):
-                self._gsxt_page = cur
+        self._search_company(page, company)
+
+        for round_no in range(1, 4):
+            self.engine.wait_manual(
+                "gsxt 已搜索「%s」：请完成验证码/滑块，并在企业列表中点击该企业进入详情页"
+                "（新标签页先显示 Environment Checking，等几秒会自动放行，不要刷新）。"
+                "进入详情页后点【继续】。" % company)
+            try:
+                pages = list(page.context.pages)
+            except Exception:
+                pages = [page]
+
+            # 平台自己跳出了登录页 → 这时才登录，登录后重新搜索
+            login_page = self._find_login_page(pages)
+            if login_page is not None and self._find_detail_page(pages) is None:
+                self.engine.log("  平台要求登录，开始登录")
+                ok = False
+                try:
+                    ok = self.ensure_login(login_page)
+                except (Aborted, Skipped):
+                    raise
+                except Exception as exc:
+                    self.engine.log("  自动登录异常：%s" % str(exc).splitlines()[0][:80])
+                if not ok:
+                    self.engine.wait_manual(
+                        "gsxt 需要登录：请在浏览器里手动完成登录，登录成功后点【继续】。")
+                self._gsxt_logged_in = True
+                self.engine.log("  登录后重新搜索：%s" % company)
+                self.open_portal(page)
+                page = getattr(self, "_gsxt_page", None) or page
+                self._search_company(page, company)
+                continue
+
+            detail = self._wait_detail(pages, timeout=30)
+            if detail is not None:
+                self._gsxt_page = detail
+                self._gsxt_in_detail = True
+                try:
+                    detail.bring_to_front()
+                except Exception:
+                    pass
+                self.engine.log("  ✔ 已进入企业详情页：%s" % (detail.url or "")[:90])
+                return True
+            self.engine.log("  ⚠ 还没找到企业详情页（第 %d 次），请确认已点击目标企业" % round_no)
+        self.engine.log("  ⚠ 未能进入企业详情页，按当前页面截图")
+        return False
+
+    def _search_company(self, page, company: str) -> None:
+        """在 gsxt 首页搜索框填企业名称并点【查询】（不登录）。"""
         self.engine.log("在 gsxt 首页搜索：%s" % company)
         # 首页可能还在载入态，填入失败就重新加载再试
         filled = False
@@ -287,56 +334,62 @@ class GsxtHandler(PlatformHandler):
             click_by_text(page, "查询", exact=False)
         self.engine.sleep(3)
 
-        self.engine.wait_manual(
-            "gsxt 搜索已触发，请完成滑块/验证码，并在弹出的企业列表中选择「%s」进入企业详情页。" % company)
+    @staticmethod
+    def _page_flags(p) -> dict:
+        try:
+            r = p.evaluate("""()=>{
+              const b=(document.body&&document.body.innerText)||'';
+              return {url:location.href, title:document.title||'',
+                      detail:/目录导航/.test(b) && /基础信息/.test(b),
+                      login:!!document.getElementById('UserName')};
+            }""")
+            return r if isinstance(r, dict) else {}
+        except Exception:
+            return {}
 
-        detail = page.evaluate("""
-        ()=>{
-          const b=document.body.innerText||'';
-          return {url:location.href, hasBasic:/基础信息/.test(b), nav:/目录导航/.test(b)};
-        }""")
-        ok = bool(detail.get("hasBasic") and detail.get("nav"))
-        self._gsxt_in_detail = ok
-        self.engine.log("  当前页 url=%s 基础信息=%s 目录导航=%s"
-                 % (str(detail.get("url", ""))[:90], detail.get("hasBasic"), detail.get("nav")))
-        if not ok:
-            self.engine.log("  ⚠ 看起来还没进入企业详情页")
-        return ok
+    def _find_detail_page(self, pages):
+        """找企业详情页（正文同时含「目录导航」「基础信息」）。后开的标签页优先。"""
+        for p in reversed(list(pages)):
+            if self._page_flags(p).get("detail"):
+                return p
+        return None
 
-    def try_auto_login(self, page) -> bool:
-        """配了账号密码就自动登录 gsxt。
+    def _find_login_page(self, pages):
+        """找平台弹出的登录页（shiming 子站，或页面上有 #UserName）。"""
+        for p in reversed(list(pages)):
+            try:
+                url = p.url or ""
+            except Exception:
+                url = ""
+            if "shiming.gsxt.gov.cn" in url or self._page_flags(p).get("login"):
+                return p
+        return None
 
-        公开查询其实免登录，但**登录后额度更高、验证码触发更少**，
-        所以配了账号密码就自动登录一次。
-        登录框在主页面里（不是 iframe），提交后可能弹极验滑块/点选 ——
-        那种只能人工，程序会挂起等用户处理。
-
-        登录成功后站点可能整页跳转/重定向，实际生效页面可能变化；
-        这里登录完成后会**重新定位**实际页面并回写 _gsxt_page，
-        保证后续填入操作打在真正的首页上。
-        """
-        cred = self.engine.credentials.get("gsxt") or {}
-        username = (cred.get("username") or "").strip()
-        password = cred.get("password") or ""
-        if not username or not password:
-            return False
-        if getattr(self, "_gsxt_logged_in", False):
-            return True
-        ok = self.engine.auto_login(page, "gsxt", "国家企业信用信息公示系统")
-        if ok:
-            self._gsxt_logged_in = True
-            # 登录成功后页面可能整页跳转/重定向，重新定位实际生效页面
-            cur = self._locate_active_page(page)
-            if cur is not None and cur is not page:
-                self._gsxt_page = cur
-                self.engine.log("  登录后页面已切换，重新定位到实际首页")
-            page = cur or page
-            # 登录成功会刷新页面，重新等搜索框
-            if not self.wait_keyword(page, timeout=20):
-                # 搜索框还没出来：可能被瑞数拦了，重新走上级目录跳转
-                self.engine.log("  ↻ 登录后首页未就绪，重新通过上级目录跳转进入")
-                self.open_portal(page)
-        return ok
+    def _wait_detail(self, pages, timeout: int = 30):
+        """等详情页出现。遇到 Environment Checking 只等不刷新。"""
+        deadline = time.time() + timeout
+        hinted = False
+        page0 = pages[0] if pages else None
+        while True:
+            self.engine.check_stop()
+            hit = self._find_detail_page(pages)
+            if hit is not None:
+                return hit
+            if time.time() >= deadline:
+                return None
+            if not hinted:
+                checking = any("Environment" in (self._page_flags(p).get("title") or "")
+                               for p in pages)
+                if checking:
+                    self.engine.log("  详情页正在做环境校验（Environment Checking），等待自动放行…")
+                    hinted = True
+            self.engine.sleep(1.5)
+            # 期间可能又开了新标签页，重新取一次
+            if page0 is not None:
+                try:
+                    pages = list(page0.context.pages)
+                except Exception:
+                    pass
 
     def _locate_active_page(self, page):
         """在浏览器上下文里找 gsxt 的实际页面（优先 #keyword 所在的页）。"""
@@ -395,6 +448,7 @@ class GsxtHandler(PlatformHandler):
     def collect_basic(self, page, company: str, code: str, step: dict) -> str:
         """gsxt 企业详情 - 基础信息 + 全部股东及出资详细信息。"""
         self.enter_detail(page, company)
+        page = getattr(self, "_gsxt_page", None) or page
         click_by_text(page, "基础信息", exact=False)
         self.engine.sleep(1.5)
         expanded = page.evaluate("""
@@ -486,6 +540,7 @@ class GsxtHandler(PlatformHandler):
         """
         if not getattr(self, "_gsxt_in_detail", False):
             self.enter_detail(page, company)
+        page = getattr(self, "_gsxt_page", None) or page
 
         kw = (step.get("section") or "").strip()
         if not kw:
