@@ -252,6 +252,7 @@ class GsxtHandler(PlatformHandler):
             self.engine.wait_manual(
                 "gsxt 已搜索「%s」：请完成验证码/滑块，并在企业列表中点击该企业进入详情页"
                 "（新标签页先显示 Environment Checking，等几秒会自动放行，不要刷新）。"
+                "若点【查询】后没跳转到企业列表，请手动再点一次【查询】。"
                 "进入详情页后点【继续】。" % company)
             try:
                 pages = list(page.context.pages)
@@ -294,32 +295,88 @@ class GsxtHandler(PlatformHandler):
         return False
 
     def _search_company(self, page, company: str) -> None:
-        """在 gsxt 首页搜索框填企业名称并点【查询】（不登录）。"""
-        self.engine.log("在 gsxt 首页搜索：%s" % company)
-        # 首页可能还在载入态，填入失败就重新加载再试
-        filled = False
+        """在 gsxt 首页搜索框填企业名称并点【查询】（不登录）。
+
+        站点有特殊限制：经常出现「点了查询没跳转」——
+        瑞数链路没就绪、输入值没被站点脚本读到时都表现为毫无反应。
+        所以这里每一步都验证，不靠猜：
+          1) 填词后**回读输入框**，确认值真的写进去了；
+          2) 点查询后 6 秒内确认「有反应」——跳到 corp-query-search 结果页，
+             或极验/图形验证弹层出现；
+          3) 没反应依次回落：Playwright 真实鼠标点击 → 输入框回车
+             → 重走入口链再来一轮（最多 3 轮）。
+        """
+        reacted = False
         for attempt in range(1, 4):
-            if fill_controlled(page, "() => document.getElementById('keyword')", company):
-                filled = True
-                break
-            if set_native(page, "() => document.getElementById('keyword')", company):
-                filled = True
-                break
-            if attempt < 3:
-                self.engine.log("  ↻ 搜索框还没就绪，重新加载首页再试（第 %d 次）" % (attempt + 1))
+            if attempt > 1:
+                self.engine.log("  ↻ 搜索没有反应，重走入口链再试（第 %d 轮）" % attempt)
                 self.open_portal(page)
-        if not filled:
-            raise EngineError("gsxt 搜索框定位/填入失败")
-        self.engine.sleep(0.8)
-        # 精确触发查询按钮：gsxt 首页的搜索按钮是 <button id="btn_query" class="abs search_btn"></button>，
-        # 其 innerText 是空的！不能仅按文本匹配，必须优先精确点击 #btn_query 与 .search_btn。
+                page = getattr(self, "_gsxt_page", None) or page
+            self.engine.log("在 gsxt 首页搜索：%s" % company)
+
+            # ---- 填词 + 回读校验（防止「看着填上了其实没写进去」）----
+            filled = False
+            for fill_attempt in range(1, 4):
+                if self._fill_keyword(page, company):
+                    readback = ""
+                    try:
+                        readback = str(page.evaluate(
+                            "()=>(document.getElementById('keyword')||{}).value||''"))
+                    except Exception:
+                        pass
+                    if readback.strip() == company.strip():
+                        filled = True
+                        break
+                    self.engine.log("  ⚠ 输入框回读值不匹配（%r），重填（第 %d 次）"
+                             % (readback[:20], fill_attempt + 1))
+                if fill_attempt < 3:
+                    self.engine.sleep(1.2)
+            if not filled:
+                self.engine.log("  ⚠ 搜索框定位/填入失败，进入下一轮重试")
+                continue
+            self.engine.sleep(0.8)
+
+            # ---- 点查询 + 验证有反应 ----
+            self._click_query(page)
+            if self._wait_search_reaction(page, timeout=6):
+                reacted = True
+                break
+
+            # ---- 回落：真实鼠标点击 / 回车 ----
+            self.engine.log("  ⚠ 点【查询】后没有跳转，改用真实鼠标点击再试")
+            try:
+                page.locator("#btn_query").first.click(timeout=4000)
+            except Exception:
+                try:
+                    page.locator("#keyword").first.press("Enter", timeout=3000)
+                except Exception:
+                    pass
+            if self._wait_search_reaction(page, timeout=6):
+                reacted = True
+                break
+
+        if not reacted:
+            self.engine.log("  ⚠ 自动搜索始终没有跳转（已重试 3 轮）。"
+                            "请在浏览器里手动点【查询】完成搜索。")
+
+    def _fill_keyword(self, page, company: str) -> bool:
+        """把企业名称填进搜索框（原生 setter + input/change 事件）。"""
+        try:
+            if fill_controlled(page, "() => document.getElementById('keyword')", company):
+                return True
+            return bool(set_native(page, "() => document.getElementById('keyword')", company))
+        except Exception:
+            return False
+
+    def _click_query(self, page) -> str:
+        """精确点【查询】：gsxt 的按钮 innerText 是空的，必须按 id 找。"""
         clicked = page.evaluate("""()=>{
           // 先关闭可能残留的弹窗/模态层
           const closeBtns = [...document.querySelectorAll('.layui-layer-close, .popup-close, .close, [class*=close]')];
           for(const c of closeBtns){
             if(c.offsetWidth > 0 && c.offsetHeight > 0) c.click();
           }
-          const btn = document.getElementById('btn_query') 
+          const btn = document.getElementById('btn_query')
                    || document.querySelector('.search_btn')
                    || [...document.querySelectorAll('button, a, input[type=button], input[type=submit]')]
                       .find(e => /查询|搜索/.test((e.innerText||e.value||e.title||'').trim()));
@@ -328,11 +385,42 @@ class GsxtHandler(PlatformHandler):
           btn.click();
           return 'OK:' + (btn.id || btn.className || btn.tagName);
         }""")
-        self.engine.log("  触发 gsxt 查询按钮：%s" % clicked)
         if not str(clicked).startswith("OK"):
             click_by_text(page, "查 询", exact=False)
             click_by_text(page, "查询", exact=False)
-        self.engine.sleep(3)
+        self.engine.log("  触发 gsxt 查询按钮：%s" % clicked)
+        return str(clicked)
+
+    def _wait_search_reaction(self, page, timeout: float = 6.0) -> bool:
+        """等搜索「有反应」：任一标签页跳到结果页，或验证弹层出现。
+
+        之前的问题是点完就 blind sleep(3)，跳没跳转完全不知道，
+        用户看到的就是「搜了但不动」。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.engine.check_stop()
+            try:
+                for p in page.context.pages:
+                    if "corp-query-search" in (p.url or ""):
+                        self.engine.log("  ✔ 已跳转到搜索结果页：%s" % (p.url or "")[:90])
+                        if p is not getattr(self, "_gsxt_page", None):
+                            self._gsxt_page = p
+                        return True
+            except Exception:
+                pass
+            try:
+                has_gt = page.evaluate(
+                    "()=>{const e=document.querySelector('.geetest_holder,.geetest_panel,#popup-captcha');"
+                    "if(!e) return false; const r=e.getBoundingClientRect();"
+                    "return r.width>40 && r.height>40;}")
+                if has_gt:
+                    self.engine.log("  ✔ 已触发验证（极验/图形验证码）")
+                    return True
+            except Exception:
+                pass
+            self.engine.sleep(0.5)
+        return False
 
     @staticmethod
     def _page_flags(p) -> dict:

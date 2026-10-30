@@ -112,7 +112,15 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\_internal"
   RMDir "$INSTDIR"
 
+  ; 桌面快捷方式：先清属性再删（NSIS 的 Delete 对只读文件会静默失败），
+  ; 并把「当前用户」「所有用户」两个上下文都扫一遍，
+  ; 覆盖桌面被重定向 / 快捷方式被建到公共桌面的情况。
+  SetFileAttributes "$DESKTOP\${APP_NAME}.lnk" NORMAL
   Delete "$DESKTOP\${APP_NAME}.lnk"
+  SetShellVarContext all
+  SetFileAttributes "$DESKTOP\${APP_NAME}.lnk" NORMAL
+  Delete "$DESKTOP\${APP_NAME}.lnk"
+  SetShellVarContext current
   RMDir /r "$SMPROGRAMS\${APP_NAME}"
 
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"

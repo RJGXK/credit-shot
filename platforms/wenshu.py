@@ -390,19 +390,23 @@ class WenshuHandler(PlatformHandler):
         """裁判文书网登录后会显示手机号，截图前把正文里的手机号临时打码。
 
         用 window 全局暂存被改写的文本节点，截图后由 _unmask_phones 还原。
+
+        正则必须带前后「非数字」断言（(?<!\\d)…(?!\\d)）：
+        否则 18 位身份证号里含「1+3~9」开头的 11 位子串
+        （如 …19920313861…）会被当成手机号误伤，把身份证号也改了。
         """
         try:
             page.evaluate("""()=>{
               if(window.__csPhoneSaved__) return;   // 已经打码，避免重复
-              const PH=/1[3-9]\\d{9}/g;
               const saved=[];
               const walk=(root)=>{
                 for(const n of Array.from(root.childNodes)){
                   if(n.nodeType===3){
                     const t=n.nodeValue||'';
-                    if(/1[3-9]\\d{9}/.test(t)){
+                    if(/(?<!\\d)1[3-9]\\d{9}(?!\\d)/.test(t)){
                       saved.push({n:n, old:t});
-                      n.nodeValue=t.replace(/1[3-9]\\d{9}/g, m=>m.slice(0,3)+'****'+m.slice(7));
+                      n.nodeValue=t.replace(/(?<!\\d)1[3-9]\\d{9}(?!\\d)/g,
+                                            m=>m.slice(0,3)+'****'+m.slice(7));
                     }
                   } else if(n.nodeType===1 &&
                             !/^(SCRIPT|STYLE|INPUT|TEXTAREA)$/i.test(n.tagName)){

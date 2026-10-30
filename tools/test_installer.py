@@ -127,6 +127,18 @@ def main() -> int:
         print("请先运行：python tools/build_installer.py")
         return 1
 
+    # 先清掉**本应用自己**上次测试留下的桌面快捷方式残留：
+    # 不清的话，最后一步「桌面快捷方式已清理」分不清「卸载器没删」
+    # 还是「上一轮的旧文件」，检查就不确定性了。（只删本应用自己的 lnk，安全）
+    _desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+    _stale_lnk = os.path.join(_desktop, APP_TITLE + ".lnk")
+    if os.path.isfile(_stale_lnk):
+        try:
+            os.remove(_stale_lnk)
+            print("（已清理上次残留的桌面快捷方式：%s）" % _stale_lnk)
+        except OSError:
+            pass
+
     print("=== 1) 静默安装 ===")
     print("安装包：%s（%.1f MB）"
           % (INSTALLER, os.path.getsize(INSTALLER) / 1024 / 1024))
@@ -235,6 +247,12 @@ def main() -> int:
 
     desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
     lnk = os.path.join(desktop, "企业信用一键截图工具.lnk")
+    # 卸载器静默模式是「复制自身到 %TEMP% 再执行」：目录删完到 lnk 删除
+    # 之间有先后顺序，给最多 10 秒宽限，避免检查跑在卸载器前面。
+    for _ in range(10):
+        if not os.path.isfile(lnk):
+            break
+        time.sleep(1)
     check("桌面快捷方式已清理", not os.path.isfile(lnk))
 
     print("\n通过 %d / 失败 %d" % (len(PASS), len(FAIL)))

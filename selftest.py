@@ -426,5 +426,37 @@ class TestCaptchaRefresh(unittest.TestCase):
         self.assertTrue(any("刷新" in m for m in logs))
 
 
+# ================================================================ 打码（手机号）
+class TestWenshuPhoneMask(unittest.TestCase):
+    """裁判文书网截图打码：只打手机号，不许伤到身份证号。"""
+
+    _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "platforms", "wenshu.py")
+
+    def test_mask_regex_has_digit_guards(self):
+        r"""打码正则必须带 (?<!\d)…(?!\d) 断言。
+
+        没有断言时，18 位身份证号里「1+3~9」开头的 11 位子串
+        （如 …19920313861…）会被当成手机号误改——v2.1.3 踩过。
+        """
+        with open(self._SRC, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("(?<!\\\\d)1[3-9]\\\\d{9}(?!\\\\d)", src,
+                      "wenshu._mask_phones 的正则丢了非数字边界断言")
+
+    def test_regex_semantics(self):
+        """同语义在 Python 侧验证：身份证号不命中，手机号命中并被打码。"""
+        import re
+        pat = r"(?<!\d)1[3-9]\d{9}(?!\d)"
+        idcard = "身份证号410102199203138618。"
+        phone = "联系电话13812345678。"
+        self.assertEqual(re.findall(pat, idcard), [],
+                         "身份证号不应该命中手机号正则")
+        self.assertEqual(re.findall(pat, phone), ["13812345678"])
+        masked = re.sub(pat, lambda m: m.group(0)[:3] + "****" + m.group(0)[7:],
+                        phone)
+        self.assertEqual(masked, "联系电话138****5678。")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

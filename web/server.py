@@ -23,7 +23,7 @@ from web.api import router
 __all__ = ["create_app", "serve", "find_free_port", "open_browser", "resource_dir"]
 
 APP_NAME = "企业信用截图工具"
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.1.4"
 
 # 打包成 exe 后，静态资源被收集到 PyInstaller 的解包目录下（sys._MEIPASS），
 # 而源码运行时它们就在 web/ 里。两种情况要分别取到正确的目录。
@@ -123,8 +123,9 @@ def open_browser(url: str) -> None:
                 webbrowser.open(url)
             except Exception:
                 pass
-    # 独立线程 + 稍作延迟：等服务真正监听上再打开，否则浏览器会先拿到连接错误页
-    threading.Timer(1.2, _open).start()
+    # 独立线程 + 极短延迟：调用方（_wait_until_serving）已经确认端口真的
+    # 能连上才会走到这里，不需要再白等 1.2 秒。
+    threading.Timer(0.1, _open).start()
 
 
 def _wait_until_serving(host: str, port: int, on_ready, url: str,
@@ -204,6 +205,8 @@ def serve(host: str = "127.0.0.1", port: Optional[int] = None,
 
     # 轮询端口，直到真的能连上（uvicorn 的 startup 事件比实际可连接早若干秒，
     # 打包后解包 200MB 资源时更明显）。连上了才算「就绪」，此时再开浏览器。
+    # 两个分支都必须走 _wait_until_serving：服务 <1s 就绪时，
+    # 固定 3 秒定时器是纯白等（实测开界面白等 3~4 秒）。
     if on_ready is not None:
         def _ready(url):
             if open_ui:
@@ -211,7 +214,9 @@ def serve(host: str = "127.0.0.1", port: Optional[int] = None,
             on_ready(url)
         _wait_until_serving(host, port, _ready, url)
     elif open_ui:
-        threading.Timer(3.0, lambda: open_browser(url)).start()
+        def _ready(url):
+            open_browser(url)
+        _wait_until_serving(host, port, _ready, url)
 
     # 主线程守活：等服务线程结束（或进程被结束）。
     # 用 Event 而不是 join 轮询：windowed 模式下主线程必须真正阻塞，
