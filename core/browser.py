@@ -127,6 +127,7 @@ class BrowserSession:
         self.pw = None              # playwright 实例
         self.browser_obj = None     # CDP 浏览器对象
         self.ctx = None             # 浏览器上下文
+        self.page = None            # 引擎当前持有的主页（close() 返回的那个）
 
     @staticmethod
     def free_port(start: int = 9333) -> int:
@@ -406,6 +407,9 @@ class BrowserSession:
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
         self.ctx = ctx
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        # 记住引擎持有的主页：平台处理器的「清理多余标签页」必须保住它
+        # （v2.2.7 实测把它关掉后后续所有采集组全链 Target page closed）
+        self.page = page
         try:
             page.set_default_timeout(self.timeout * 1000)
         except Exception:

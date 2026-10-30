@@ -182,8 +182,14 @@ class GsxtHandler(PlatformHandler):
             raise
         except Exception as exc:
             self.engine.log("  ✘ 进入企业详情页失败：%s" % str(exc).splitlines()[0])
-        # 上级目录跳转可能开了新标签页，后续截图要用那个页面
+        # 上级目录跳转可能开了新标签页，后续截图要用那个页面；
+        # 旧页可能已被标签清理关掉 → 必须解析出活页，否则截图也崩
         page = getattr(self, "_gsxt_page", None) or page
+        page = self._live_page(page) or page
+        if self._browser_dead():
+            self.engine.log("  ✘ 浏览器已被关闭，本组无法继续（请检查浏览器窗口）")
+            raise EngineError("浏览器已被关闭")
+        self.engine.log("  本组截图所用页面：%s" % (page.url or "<未知>")[:90])
 
         # 展开「全部股东及出资详细信息」
         expanded = page.evaluate("""
@@ -284,6 +290,12 @@ class GsxtHandler(PlatformHandler):
         # 瑞数会把这套会话判成异常（页面能开，但点【查询】毫无反应，
         # 刷新后提示「当前IP请求异常 / 您的IP最近有可疑的攻击行为」）。
         # 一律从市场监管总局点链接进来，导航天然带 Referer。
+        # 入口救援：调用方传进来的 page 可能已被上一轮的标签页清理关掉
+        # （18:04 日志实锤：黑名单组拿到已关的主页 → 全链 Target page closed）。
+        lp = self._live_page(page)
+        if lp is not None and lp is not page:
+            self.engine.log("  ⓘ 原标签页已关闭，改用现存标签页继续")
+            page = lp
         chain_res = nav.goto_via_landing(page, "gsxt", log=self.engine.log,
                                          timeout_ms=self.engine.timeout * 1000)
         # 链接带 target=_blank 时会开新标签页，后续操作要切过去。
@@ -582,24 +594,33 @@ class GsxtHandler(PlatformHandler):
     def _close_extra_tabs(self, keep, log_prefix: str = "  清理多余标签页") -> int:
         """关掉除 keep 以外的所有标签页（用户反馈「页面打开太多，不知道在操作哪个」）。
 
-        只保留 keep 和 about:blank 之外的同上下文页面；返回关闭个数。纯防御：
-        任何一步失败都不抛。
+        **保护名单（v2.2.8 教训）**：除了 keep，还必须保住——
+          · 引擎当前持有的 page（browser_session.open() 返回的那个）：
+            18:04 日志实锤，把它关掉后后续所有采集组全链
+            「Target page, context or browser has been closed」；
+          · 初始 about:blank 主页：引擎重启后第一个 tab，关掉等于砍断根。
+        返回关闭个数。纯防御：任何一步失败都不抛。
         """
         closed = 0
         try:
             if keep is None or keep.is_closed():
                 return 0
             ctx = keep.context
+            # 引擎主页：browser_session.page（connect_cdp 记录的那个）
+            # 被清理误杀后，后续所有采集组全链 Target page closed（18:04 日志实锤）
+            engine_pages = set()
+            eng_page = getattr(getattr(self.engine, "browser_session", None),
+                               "page", None)
+            if eng_page is not None:
+                engine_pages.add(id(eng_page))
             for p in list(ctx.pages):
                 if p is keep:
                     continue
                 try:
                     if p.is_closed():
                         continue
-                    u = p.url or ""
-                    if u == "about:blank":
-                        p.close()
-                        closed += 1
+                    # 保护：引擎当前持有的 page 不能关（它是后续采集组的操作根）
+                    if id(p) in engine_pages:
                         continue
                     p.close()
                     closed += 1
@@ -643,20 +664,14 @@ class GsxtHandler(PlatformHandler):
             return page
 
     def _login_succeeded(self, page) -> bool:
-        """登录是否成功：URL 已离开 shiming 登录子站（跳回 gsxt 首页），
-        或登录表单（#UserName）已不在页面上。"""
-        try:
-            cur = page.url or ""
-        except Exception:
-            cur = ""
-        if cur and "shiming.gsxt.gov.cn" not in cur and "gsxt.gov.cn" in cur:
-            return True
-        try:
-            if not page.evaluate("()=>!!document.getElementById('UserName')"):
-                return True
-        except Exception:
-            pass
-        return False
+        """登录是否真正成功：页面上出现「退出登录/个人中心/欢迎您」等登录态标志。
+
+        **v2.2.8 修正**：旧版用「URL 在 gsxt 域且不在 shiming 子站」就算成功——
+        但匿名首页同样满足这个条件（18:00:24 日志实锤：明明没登录却报
+        「当前已是登录态，跳过自动登录」，导致登录通道被永远跳过）。
+        URL 启发式必须废除，只认页面上的登录态标志。
+        """
+        return self._gsxt_is_logged_in(page)
 
     def _try_login_first(self, page):
         """登录（仅在匿名搜索被拦时才调用）：先自动填+过码，没成则交用户手动登录。
@@ -669,8 +684,9 @@ class GsxtHandler(PlatformHandler):
             是否真的登录成功；不像旧版那样无限循环弹验证码。
         """
         # 已经登录（同进程内前面已登录过 / 资料目录里带着登录态）→ 直接跳过
-        if getattr(self, "_gsxt_logged_in", False) or self._gsxt_is_logged_in(page) \
-                or self._login_succeeded(page):
+        # 注意：只用「页面上有退出登录等标志」判断，不用 URL 启发式
+        # （匿名首页也在 gsxt 域，URL 判定会误报已登录 → 登录通道被跳过）
+        if getattr(self, "_gsxt_logged_in", False) or self._gsxt_is_logged_in(page):
             self.engine.log("  gsxt：当前已是登录态，跳过自动登录")
             self._gsxt_logged_in = True
             return page
@@ -698,7 +714,7 @@ class GsxtHandler(PlatformHandler):
                 "若仍停在登录页，说明验证还没过，请再点一次【登录】或刷新重试。"
                 "（你已确认手动输入可以登录）")
             lp = self._live_page(page) or lp
-            if self._login_succeeded(lp) or self._gsxt_is_logged_in(lp):
+            if self._login_succeeded(lp):
                 self.engine.log("  ✔ 检测到已登录（手动）")
                 self._gsxt_logged_in = True
                 return self._after_login_enter(lp)
@@ -766,6 +782,14 @@ class GsxtHandler(PlatformHandler):
                 return False
 
         for round_no in range(1, 4):
+            # _search_company 内部可能重走入口链换了新页（旧的已关）：
+            # 这里必须重新同步活页，否则下面点查询直接崩
+            # （18:03:24 日志实锤：拿已关旧页再点 → Target page closed）
+            page = getattr(self, "_gsxt_page", None) or page
+            page = self._live_page(page) or page
+            if self._browser_dead():
+                self.engine.log("  ✘ 浏览器已被关闭，停止详情页流程")
+                return False
             # 极验可能根本没弹出来（隐藏容器曾导致误判已修，但站点行为会变）：
             # 挂起前先看一眼，没弹就自动**再真实点一次【查询】**，不干等用户。
             if round_no == 1:
@@ -1244,6 +1268,7 @@ class GsxtHandler(PlatformHandler):
         """gsxt 企业详情 - 基础信息 + 全部股东及出资详细信息。"""
         self.enter_detail(page, company)
         page = getattr(self, "_gsxt_page", None) or page
+        page = self._live_page(page) or page
         click_by_text(page, "基础信息", exact=False)
         self.engine.sleep(1.5)
         expanded = page.evaluate("""
@@ -1336,6 +1361,7 @@ class GsxtHandler(PlatformHandler):
         if not getattr(self, "_gsxt_in_detail", False):
             self.enter_detail(page, company)
         page = getattr(self, "_gsxt_page", None) or page
+        page = self._live_page(page) or page
 
         kw = (step.get("section") or "").strip()
         if not kw:
@@ -1379,9 +1405,12 @@ class GsxtHandler(PlatformHandler):
 
     def collect_blacklist(self, page, company: str, code: str, step: dict) -> str:
         """gsxt 严重违法失信企业名单（黑名单）查询。"""
+        # 前一组可能清理过标签页，传入的 page 已死 → 先解析活页
+        page = self._live_page(page) or page
         self.open_portal(page)
         # 上级目录跳转可能开了新标签页
         page = getattr(self, "_gsxt_page", None) or page
+        page = self._live_page(page) or page
         clicked = "NONE"
         for attempt in range(1, 4):
             clicked = eval_retry(page, """
