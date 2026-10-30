@@ -742,11 +742,25 @@ class GsxtHandler(PlatformHandler):
             return False
 
     def _after_login_enter(self, page):
-        """登录后重新进入首页搜索框（登录成功会整页跳回首页）。"""
+        """登录后重新进入首页搜索框（登录成功会整页跳回首页）。
+
+        v2.3.0：登录跳回首页后**补一次刷新**——登录跳转链很长
+        （shiming → gsxt），落地页偶尔渲染不全（#keyword 不出现），
+        刷新一次即可恢复（用户手动经验实锤）。
+        """
         try:
             lp = self._live_page(page) or page
             self.open_portal(lp)
-            return getattr(self, "_gsxt_page", None) or lp
+            hp = getattr(self, "_gsxt_page", None) or lp
+            # 若搜索框没就绪，刷新一次再等（登录跳转链的落地页偶尔渲染不全）
+            if not self.wait_keyword(hp, timeout=12):
+                self.engine.log("  ⓘ 登录落地页未就绪，刷新一次再等")
+                try:
+                    hp.reload(wait_until="domcontentloaded", timeout=20000)
+                except Exception:
+                    pass
+                self.wait_keyword(hp, timeout=15)
+            return hp
         except Exception as exc:
             self.engine.log("  ⚠ 登录后重新进入首页失败：%s"
                             % str(exc).splitlines()[0][:60])
@@ -797,10 +811,11 @@ class GsxtHandler(PlatformHandler):
         lp = self._live_page(page) or page
         for attempt in range(1, 4):
             self.engine.wait_manual(
-                "gsxt 需要登录才能搜索。\n"
+                "gsxt 需要登录才能搜索（匿名会话会被加速乐压制，登录态豁免）。\n"
                 "账号密码程序已自动填好：请在浏览器里手动完成验证并点【登录】按钮，"
                 "登录成功（跳回公示系统首页）后点【继续】。\n"
-                "若仍停在登录页，说明验证还没过，请再点一次【登录】或刷新重试。"
+                "若登录页一直空白/验证码不出现：点浏览器【刷新】或【返回上一级】"
+                "再重新点【登录】（实测有效），然后再试。\n"
                 "（你已确认手动输入可以登录）")
             lp = self._live_page(page) or lp
             if self._login_succeeded(lp):
@@ -814,17 +829,18 @@ class GsxtHandler(PlatformHandler):
         return self._after_login_enter(self._live_page(page) or page)
 
     def enter_detail(self, page, company: str) -> bool:
-        """gsxt：先登录（配了账号时）→ 搜索企业 → 人工过极验并点选企业 → 切到详情新标签页。
+        """gsxt：登录（配了账号时）→ 搜索企业 → 人工过极验并点选企业 → 切到详情新标签页。
 
         实测流程（2026-10-29）：
           index 页 #keyword 填名称 → #btn_query → 弹极验 → 列表页
           → 点企业**开新标签页**，先是「Environment Checking」白页，
             约 3 秒后自动变成详情页（含「目录导航」「基础信息」）。
 
-        重要修正（v2.2.3）：早期认为「全程不需要登录」，但 2026-10-29 多版实测证明
-        **匿名搜索被 WAF/IP 风控拦截**——点了查询毫无反应，或返回「当前IP请求异常」
-        拒绝页（官方提示本身就是「实名注册/登录后再进行访问」）。用户自己的浏览器正是
-        **登录态**才正常查询。所以现在：配了账号就**先登录再搜**；只有未配账号时才走匿名。
+        策略定稿（v2.3.0，2026-10-30 八组对照实验实锤）：
+          匿名会话**只有首次查询放行，第 2 次起被加速乐静默吞**
+          （清票据/重启/刷新/冷却均无效，压制在服务端会话信誉上）；
+          **登录态会话豁免**。所以配了账号 → **直接先登录再搜**
+          （登录态持久化，登一次全程免疫）；未配账号才匿名。
 
         Environment Checking 是瑞数挑战页，**只能等，不能刷新**
         （刷新会重新挑战，用户实测「刷新等 5 秒也还是白页」）。
@@ -845,16 +861,29 @@ class GsxtHandler(PlatformHandler):
         creds = (self.engine.credentials or {}).get("gsxt") or {}
         has_creds = bool(creds.get("username") and creds.get("password"))
 
-        # ① 先**匿名慢速搜索**（登录是整条链路最不稳的一环，能不登录就不登录）。
-        #    用户反馈「手动能登、软件死循环」正是因为之前一上来就强制登录。
-        self.engine.log("  → 先尝试匿名搜索（慢速输入，避免被风控判机器人）：%s" % company)
-        status = self._search_company(page, company)
-        self.engine.log("  匿名搜索结果状态：%s" % status)
+        # ① 策略定稿（2026-10-30 八组对照实验实锤）：
+        #    匿名会话**只有首次查询放行，第 2 次起被加速乐静默吞**（清票据/重启/
+        #    刷新/冷却均无效——压制在服务端会话信誉上）；**登录态会话豁免**。
+        #    所以配了账号 → **直接先登录**（登录态持久化，登一次全程免疫），
+        #    不再先烧掉匿名额度；未配账号才匿名搜（首次能过就过）。
+        if has_creds and not getattr(self, "_gsxt_logged_in", False):
+            if self._gsxt_is_logged_in(page):
+                self.engine.log("  ✔ 当前已是登录态（资料目录里有有效登录 Cookie），直接查询")
+                self._gsxt_logged_in = True
+            else:
+                self.engine.log("  → 配置了账号：直接走登录通道（匿名会话会被加速乐压制，"
+                                "登录态豁免；账号密码自动填好，验证码需人工过一次）")
+                page = self._try_login_first(page)
+                page = getattr(self, "_gsxt_page", None) or page
 
-        # ② 匿名没通过 + 配了账号 + 还没登录 → 才走登录通道，登录后重搜一次。
-        #    （匿名 'reacted' 说明已经能搜 / 弹验证码，无需登录；'blocked' 走清票据补救）
+        # ② 搜索（登录态会话或未配账号的匿名会话）
+        self.engine.log("  → 开始搜索：%s" % company)
+        status = self._search_company(page, company)
+        self.engine.log("  搜索结果状态：%s" % status)
+
+        # ③ 搜索被吞且配了账号还没登录成功 → 再走一次登录通道兜底
         if status in ("login", "none") and has_creds and not getattr(self, "_gsxt_logged_in", False):
-            self.engine.log("  匿名搜索未通过，改走登录通道（慢速输入账号密码）后重搜")
+            self.engine.log("  搜索未通过（匿名会话被压制），走登录通道后重搜")
             page = self._try_login_first(page)
             page = getattr(self, "_gsxt_page", None) or page
             status = self._search_company(page, company)
